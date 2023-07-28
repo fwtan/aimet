@@ -42,7 +42,9 @@ project(aimet)
 # TODO Needed below variable CMAKE_CXX_FLAGS_ORG for tensorflow 2.10 verasion.
 # We have use -std=c++17 -O0 -ggdb -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 for TF2.10
 set(CMAKE_CXX_FLAGS_ORG "${CMAKE_CXX_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O0 -ggdb -fPIC -D_GLIBCXX_USE_CXX11_ABI=0 -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\"")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -O0 -ggdb -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 -DPYBIND11_BUILD_ABI=\\\"_cxxabi1011\\\"")
+set(CMAKE_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/install)
+
 
 set(AIMET_INSTALL_DIR ${CMAKE_BINARY_DIR}/staging/universal)
 
