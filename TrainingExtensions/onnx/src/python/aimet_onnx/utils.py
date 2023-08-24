@@ -36,11 +36,18 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 """ Utility functions for ONNX """
-from typing import Dict, List, Union, Tuple, Set
+import itertools
+from typing import Dict, List, Union, Tuple
 
+import os
+import pickle
 import numpy as np
 import onnx
 from onnx import onnx_pb, helper, numpy_helper, mapping
+from aimet_common.utils import AimetLogger
+
+logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
+
 
 OP_TYPES_WITH_PARAMS = ['Conv', 'Gemm', 'ConvTranspose', 'BatchNormalization', 'MatMul', 'Transpose']
 
@@ -267,21 +274,21 @@ def remove_activation_hooks(model: onnx_pb.ModelProto,
         model.graph.output.remove(hook)
 
 
-def get_graph_intermediate_activations(graph: onnx_pb.GraphProto) -> Set[str]:
+def get_graph_intermediate_activations(graph: onnx_pb.GraphProto) -> List[str]:
     """
     Returns the names of all activations within a graph that are used as the input to another node
     :param graph: The graph for which to retrieve the activations
     :return: A list containing the names of all found activations
     """
-    param_names = set()
+    param_names = []
     for param in graph.initializer:
         if param.name not in param_names and param.name:
-            param_names.add(param.name)
-    activation_names = set()
+            param_names.append(param.name)
+    activation_names = []
     for node in graph.node:
         for name in node.input:
             if name not in activation_names and name not in param_names:
-                activation_names.add(name)
+                activation_names.append(name)
     return activation_names
 
 
@@ -357,3 +364,82 @@ def retrieve_constant_input(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto, 
                 weight = ParamUtils.get_param(model, other_node, 0)
                 transposed = True
     return weight, transposed
+
+
+class CachedDataset:
+    """
+    Cache number of batches from the data loader at given path location and
+    provide interface to fetch single batch of model inputs.
+    """
+
+    # pylint: disable=super-init-not-called
+    def __init__(self, data_loader, num_batches: int, path: str):
+        """
+        :param data_loader: Data loader
+        :param num_batches: Number of batches to fetch from data loader
+        :param path: Path to save model inputs
+        """
+        if len(data_loader) < num_batches:
+            raise ValueError(f'Can not fetch {num_batches} batches from '
+                             f'a data loader of length {len(data_loader)}.')
+
+        self._num_batches = num_batches
+        self._path = path
+
+        self._cache_model_inputs(itertools.islice(data_loader, num_batches))
+
+    def __len__(self):
+        return self._num_batches
+
+    def __getitem__(self, index: int):
+        path = os.path.join(self._path, 'model_inputs_' + str(index))
+
+        with open(path, 'rb') as file:
+            batch = pickle.load(file)
+
+        return batch
+
+    def _cache_model_inputs(self, data_loader):
+        """
+        Function to cache number of batches individually in separate file at provided path location
+        """
+        if not os.path.exists(self._path):
+            os.makedirs(self._path)
+
+        for i, batch in enumerate(data_loader):
+            path = os.path.join(self._path, f'model_inputs_{i}')
+            with open(path, 'wb') as file:
+                pickle.dump(batch, file)
+
+        logger.info('Caching %d batches from data loader at path location: %s', self._num_batches, self._path)
+
+
+def create_input_dict(model: onnx_pb.ModelProto, input_batch: Union[np.ndarray, List[np.ndarray], Tuple[np.ndarray]]) -> Dict:
+    """
+    Creates input dictionary (input name to input value map) for session.run
+
+    :param model: ONNX model
+    :param input_batch: either single numpy array, list or tuple of numpy array
+    :return: input dictionary
+    """
+    input_names = [input.name for input in model.graph.input]
+
+    # single input
+    if isinstance(input_batch, np.ndarray):
+        input_batch_list = [input_batch]
+
+    # list of multiple inputs
+    elif isinstance(input_batch, list):
+        input_batch_list = input_batch
+
+    # tuple of multiple inputs
+    elif isinstance(input_batch, tuple):
+        input_batch_list = list(input_batch)
+
+    else:
+        raise ValueError('Input batch should be either numpy array, list or tuple')
+
+    if not len(input_names) == len(input_batch_list):
+        raise ValueError('There is mismatch between number of input names and input tensors')
+
+    return dict(zip(input_names, input_batch_list))

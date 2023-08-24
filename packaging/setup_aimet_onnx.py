@@ -53,6 +53,11 @@ if common_dep_whl is not None:
 else:
     sys.exit("Could not find dependency wheel file for package: %s" % package_name)
 
+torch_dep_whl = get_dependency_wheel("AimetTorch")
+if torch_dep_whl is not None:
+    torch_dep_whl_url = package_url_base + "/" + torch_dep_whl
+    dependency_url_list.append(torch_dep_whl_url)
+
 # Obtain package contents; exclude build and certain other files including those from other packages
 packages_found = find_packages() + \
     find_namespace_packages(exclude=['*bin', 'pyenv3*', 'build', 'dist', '*bin', '*x86*', '*aimet_common*','*aimet_torch*','*aimet_tensorflow*'])
@@ -97,7 +102,7 @@ setup(
     include_package_data=True,
     zip_safe=True,
     platforms='x86',
-    python_requires='>=3.6',
+    python_requires='>=3.8',
     cmdclass={
         'bdist_wheel': bdist_wheel_aimet,
     },

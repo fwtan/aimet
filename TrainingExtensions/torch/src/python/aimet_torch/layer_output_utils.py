@@ -42,6 +42,7 @@ import os
 from typing import Union, Dict, List, Tuple
 from enum import Enum
 import shutil
+import re
 
 import numpy as np
 import onnx
@@ -61,31 +62,32 @@ logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.LayerOutputs)
 
 
 class NamingScheme(Enum):
-    """ Enumeration to specify layer-output naming scheme while generating intermediate layer-outputs of quantsim
-    model """
+    """ Enumeration of layer-output naming schemes. """
 
-    PYTORCH = 1  # names outputs according to exported pytorch model
-    ONNX = 2  # names outputs according to exported onnx model
-    TORCHSCRIPT = 3  # names outputs according to exported torchscript model
+    PYTORCH = 1
+    """ Names outputs according to exported pytorch model. Layer names are used. """
+    ONNX = 2
+    """ Names outputs according to exported onnx model. Layer output names are generally numeric. """
+    TORCHSCRIPT = 3
+    """ Names outputs according to exported torchscript model. Layer output names are generally numeric. """
 
 
 class LayerOutputUtil:
-    """ Implementation to capture and save outputs of intermediate layers of a model (fp32/quantsim) """
+    """ Implementation to capture and save outputs of intermediate layers of a model (fp32/quantsim). """
 
     def __init__(self, model: torch.nn.Module, dir_path: str, naming_scheme: NamingScheme = NamingScheme.PYTORCH,
                  dummy_input: Union[torch.Tensor, Tuple, List] = None, onnx_export_args: Union[OnnxExportApiArgs, Dict] = None):
         """
-        Constructor - It initializes the utility classes that captures and saves layer-outputs
+        Constructor for LayerOutputUtil.
 
         :param model: Model whose layer-outputs are needed.
         :param dir_path: Directory wherein layer-outputs will be saved.
         :param naming_scheme: Naming scheme to be followed to name layer-outputs. There are multiple schemes as per
             the exported model (pytorch, onnx or torchscript). Refer the NamingScheme enum definition.
-        :param dummy_input: Dummy input to model (required if naming_scheme is 'onnx')
+        :param dummy_input: Dummy input to model. Required if naming_scheme is 'NamingScheme.ONNX' or 'NamingScheme.TORCHSCRIPT'.
         :param onnx_export_args: Should be same as that passed to quantsim export API to have consistency between
-            layer-output names present in exported onnx model and generated layer-outputs. (required if naming_scheme is
-            'onnx')
-        :return: None
+            layer-output names present in exported onnx model and generated layer-outputs. Required if naming_scheme is
+            'NamingScheme.ONNX'.
         """
 
         # Utility to capture layer-outputs
@@ -100,7 +102,7 @@ class LayerOutputUtil:
         This method captures output of every layer of a model & saves the inputs and corresponding layer-outputs to disk.
 
         :param input_batch: Batch of inputs for which we want to obtain layer-outputs.
-        :return:
+        :return: None
         """
 
         logger.info("Generating layer-outputs for %d input instances", len(input_batch))
@@ -109,8 +111,8 @@ class LayerOutputUtil:
         layer_output_batch_dict = self.layer_output.get_outputs(input_batch)
 
         # Place inputs and layer-outputs on CPU
-        input_batch = LayerOutputUtil.get_input_batch_in_numpy(input_batch)
-        layer_output_batch_dict = LayerOutputUtil.get_layer_output_batch_in_numpy(layer_output_batch_dict)
+        input_batch = LayerOutputUtil._get_input_batch_in_numpy(input_batch)
+        layer_output_batch_dict = LayerOutputUtil._get_layer_output_batch_in_numpy(layer_output_batch_dict)
 
         # Save inputs and layer-outputs
         self.save_input_output.save(input_batch, layer_output_batch_dict)
@@ -118,7 +120,7 @@ class LayerOutputUtil:
         logger.info('Successfully generated layer-outputs for %d input instances', len(input_batch))
 
     @staticmethod
-    def get_input_batch_in_numpy(input_batch: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor]]) -> \
+    def _get_input_batch_in_numpy(input_batch: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor]]) -> \
             Union[np.ndarray, List[np.ndarray], Tuple[np.ndarray]]:
         """
         Coverts the torch tensors into numpy arrays
@@ -133,7 +135,7 @@ class LayerOutputUtil:
         return input_batch.cpu().numpy()
 
     @staticmethod
-    def get_layer_output_batch_in_numpy(layer_output_dict: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+    def _get_layer_output_batch_in_numpy(layer_output_dict: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
         """
         Converts the torch tensors into numpy arrays
         :param layer_output_dict: layer output dictionary with torch tensors
@@ -173,16 +175,23 @@ class LayerOutput:
         self.is_quantsim_model = bool(quant_modules)
 
         # Obtain layer-name to layer-output name mapping
-        self.layer_name_to_layer_output_dict = None
+        self.layer_name_to_layer_output_dict = {}
+        self.layer_name_to_layer_output_name_dict = {}
         if naming_scheme == NamingScheme.PYTORCH:
-            self.layer_name_to_layer_output_name_dict = None
-            layer_output_names = [name.replace('._module_to_wrap', '') for name, module in model.named_modules() if utils.is_leaf_module(module)]
+            for name, module in model.named_modules():
+                if utils.is_leaf_module(module):
+                    name = name.replace('._module_to_wrap', '')
+                    self.layer_name_to_layer_output_name_dict[name] = name
         else:
             self.layer_name_to_layer_output_name_dict = LayerOutput.get_layer_name_to_layer_output_name_map(
                 self.model, naming_scheme, dummy_input, onnx_export_args, dir_path)
-            layer_output_names = list(self.layer_name_to_layer_output_name_dict.values())
+
+        # Replace any delimiter in layer-output name string with underscore
+        for layer_name, output_name in self.layer_name_to_layer_output_name_dict.items():
+            self.layer_name_to_layer_output_name_dict[layer_name] = re.sub(r'\W+', "_", output_name)
 
         # Save layer-output names which are in topological order of model graph. This order can be used while comparing layer-outputs.
+        layer_output_names = list(self.layer_name_to_layer_output_name_dict.values())
         save_layer_output_names(layer_output_names, dir_path)
 
     def get_outputs(self, input_batch: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -220,23 +229,30 @@ class LayerOutput:
         :return: None
         """
         layer_name = self.module_to_name_dict[module]
-        self.layer_name_to_layer_output_dict[layer_name] = output
+        self.layer_name_to_layer_output_dict[layer_name] = output.clone()
 
     @staticmethod
     def rename_layer_outputs(layer_name_to_layer_output_dict: Dict[str, torch.Tensor],
                              layer_name_to_layer_output_name_dict: Dict[str, str]) -> Dict[str, torch.Tensor]:
-        """ Rename layer-outputs based on the layer-name to layer-output name map """
+        """
+        Rename layer-outputs based on the layer-name to layer-output name map
 
-        layer_output_name_to_layer_output_dict = {}
+        :param layer_name_to_layer_output_dict: Dict containing layer-outputs
+        :param layer_name_to_layer_output_name_dict: Dict containing layer-output names
+        :return: layer_output_name_to_layer_output_dict
+        """
+        layer_names = list(layer_name_to_layer_output_dict.keys())
 
-        if layer_name_to_layer_output_name_dict:
-            for layer_name in layer_name_to_layer_output_name_dict:
-                output_name = layer_name_to_layer_output_name_dict[layer_name]
-                layer_output_name_to_layer_output_dict[output_name] = layer_name_to_layer_output_dict[layer_name]
-        else:
-            layer_output_name_to_layer_output_dict = layer_name_to_layer_output_dict
+        for layer_name in layer_names:
+            if layer_name in layer_name_to_layer_output_name_dict:
+                # Rename the layer-output by using layer-output name, instead of layer-name
+                layer_output_name = layer_name_to_layer_output_name_dict[layer_name]
+                layer_name_to_layer_output_dict[layer_output_name] = layer_name_to_layer_output_dict.pop(layer_name)
+            else:
+                # Delete the layer-output as it doesn't have a name
+                layer_name_to_layer_output_dict.pop(layer_name)
 
-        return layer_output_name_to_layer_output_dict
+        return layer_name_to_layer_output_dict
 
     @staticmethod
     def get_layer_name_to_layer_output_name_map(model, naming_scheme: NamingScheme, dummy_input: Union[torch.Tensor, Tuple, List],

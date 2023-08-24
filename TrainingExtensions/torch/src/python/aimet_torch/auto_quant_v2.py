@@ -282,6 +282,7 @@ class AutoQuant: # pylint: disable=too-many-instance-attributes
         )
         self._model_preparer_kwargs = dict(
             modules_to_exclude=None,
+            module_classes_to_exclude=None,
             concrete_args=None,
         )
 
@@ -374,19 +375,22 @@ class AutoQuant: # pylint: disable=too-many-instance-attributes
 
     def set_model_preparer_params(
             self,
-            modules_to_exclude: List[torch.nn.Module] = None,
+            modules_to_exclude: Optional[List[torch.nn.Module]] = None,
+            module_classes_to_exclude: Optional[List[torch.nn.Module]] = None,
             concrete_args: Optional[Dict[str, Any]] = None,
     ):
         """
         Set parameters for model preparer.
 
         :param modules_to_exclude: List of modules to exclude when tracing.
+        :param module_classes_to_exclude: List of module classes to exclude when tracing.
         :param concrete_args: Parameter for model preparer. Allows you to partially specialize
             your function, whether it's to remove control flow or data structures. If the
             model has control flow, torch.fx won't be able to trace the model. Check
             torch.fx.symbolic_trace API in detail.
         """
         self._model_preparer_kwargs["modules_to_exclude"] = copy.copy(modules_to_exclude)
+        self._model_preparer_kwargs["module_classes_to_exclude"] = copy.copy(module_classes_to_exclude)
         self._model_preparer_kwargs["concrete_args"] = copy.copy(concrete_args)
 
     def _create_quantsim_and_encodings( # pylint: disable=too-many-arguments, too-many-locals, too-many-branches
@@ -1206,8 +1210,8 @@ def spy_auto_quant(auto_quant: AutoQuant):
         Spy that collects the handles to the ptq result of
         each stage of AutoQuant.
         """
-        def __init__(self):
-            self._eval_manager = None
+        def __init__(self, eval_manager):
+            self._eval_manager = eval_manager
 
         def get_all_ptq_results(self) -> List[PtqResult]:
             """Return handles to the results of AutoQuant"""
@@ -1216,21 +1220,18 @@ def spy_auto_quant(auto_quant: AutoQuant):
             return [sess.ptq_result for sess in self._eval_manager._all_sessions.values()
                     if sess.ptq_result is not None]
 
-    spy = Spy()
+    spy = Spy(auto_quant.eval_manager)
 
-    _auto_quant_main = auto_quant._auto_quant_main
+    _optimize_main = auto_quant._optimize_main
 
-    def _auto_quant_main_wrapper(fp32_model, target_acc, dummy_input,
-                                 eval_manager, results_dir="/tmp"):
-        spy._eval_manager = eval_manager
-        return _auto_quant_main(fp32_model, target_acc, dummy_input,
-                                eval_manager, results_dir)
+    def _optimize_main_wrapper(fp32_model, target_acc):
+        return _optimize_main(fp32_model, target_acc)
 
     try:
-        setattr(auto_quant, "_auto_quant_main", _auto_quant_main_wrapper)
+        setattr(auto_quant, "_optimize_main", _optimize_main_wrapper)
         yield spy
     finally:
-        setattr(auto_quant, "_auto_quant_main", _auto_quant_main)
+        setattr(auto_quant, "_optimize_main", _optimize_main)
 
 
 def _build_flowchart_metadata(result: Mapping) -> Dict: # pylint: disable=too-many-return-statements

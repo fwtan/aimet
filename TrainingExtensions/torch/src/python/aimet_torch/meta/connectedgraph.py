@@ -56,12 +56,32 @@ from aimet_torch.meta.operation import Op
 from aimet_torch.utils import is_leaf_module, run_hook_for_layers_with_given_input, in_eval_mode, \
     is_torch_nn_leaf_module, is_custom_leaf_module, get_torch_tensortype_shape
 from aimet_torch import onnx_utils
+import aimet_torch.utils
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.ConnectedGraph)
 
 # Global dictionary holding arguments to be used in ConnectedGraph's torch.jit.trace. Can be imported and modified by
 # users as needed.
 jit_trace_args = {'check_trace': False}
+
+# Dictionary mapping connected graph op types to a tuple consisting of:
+# index 0: number of expected inputs
+# index 1: whether in the order of inputs to the op, if the expected inputs come at the front of the list (True) or the
+# back of the list (False).
+# This is needed for removing certain constant inputs to ops which we don't want to exist, for example mangled Conv and
+# BN ops which expose parameter inputs as constant inputs to the op.
+op_inputs_dict = {
+    'Conv': (1, False),
+    'ConvTranspose': (1, False),
+    'BatchNormalization': (1, False),
+    'Gemm': (1, False),
+    'Add': (2, True)
+}
+
+# When traced, the leaf level module for these ops may have ordering of inputs flipped. We trace into these modules in
+# order to determine the true input ordering.
+MULTI_INPUT_OPS_TO_PARSE = [elementwise_ops.Add, elementwise_ops.Multiply, elementwise_ops.Subtract,
+                            elementwise_ops.Divide, elementwise_ops.Pow]
 
 # pylint: disable=too-many-lines
 # pylint: disable=protected-access
@@ -275,6 +295,10 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         self._transform_ops_and_products_to_connected_graph_convention()
         self._fill_op_and_product_properties(module_tensor_shapes_map)
 
+        # In certain models, a 'mangled' version of nodes like Conv or BN appears in the trace which exposes parameters
+        # as constant inputs to the node. In such cases, remove constant inputs since param products will be created
+        # to track them.
+        self._remove_inputs_for_ops()
         # Create parameters for ops such as conv, batchnorm, etc.
         self._create_param_products()
 
@@ -470,7 +494,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         # it is necessary to parse the interior of the elementwise op's CallMethod to extract information about
         # constants being passed in, or the order in which operands are used.
         if self._is_recursive_parsing_needed(subgraph_model, module_to_jit_trace) or \
-                self._is_multi_input_op(subgraph_model):
+                self._is_multi_input_op_to_parse(subgraph_model):
             node_name_to_subgraph_model[getattr_node_info.node_alias] = (subgraph_model, getattr_node_info)
 
     # pylint: disable=too-many-arguments
@@ -504,7 +528,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             subgraph_model, getattr_node_info = node_name_to_subgraph_model[input_name]
             # For elementwise ops, we need to parse the callmethod interior, but want to retain information about the
             # elementwise op's residing module and torch module
-            if self._is_multi_input_op(subgraph_model):
+            if self._is_multi_input_op_to_parse(subgraph_model):
                 elementwise_info = (residing_module, node_name_to_module[input_name])
             trace_levels = [getattr_node_info.node_name]
             # If node_input (input to the current GetAttr node) is None, we are at the topmost level, and can call
@@ -520,7 +544,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
 
             # For elementwise ops, we need to parse the callmethod interior, but want to retain information about the
             # elementwise op's residing module and torch module
-            if self._is_multi_input_op(subgraph_model):
+            if self._is_multi_input_op_to_parse(subgraph_model):
                 aten_nodes = self._find_aten_nodes_in_forward_pass(subgraph_trace)
                 assert len(aten_nodes) <= 1
                 if len(aten_nodes) == 1:
@@ -905,23 +929,60 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             module = op.get_module()
             if module is not None:
                 name = self._module_to_name.get(module, None)
-                if op.type in ['Conv', 'ConvTranspose', 'BatchNormalization', 'Gemm']:
-                    if module.weight is not None:
-                        product_name = name + '.weight'
-                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.weight.shape))
-                    if module.bias is not None:
-                        product_name = name + '.bias'
-                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.bias.shape))
-                if op.type == 'BatchNormalization':
-                    # If batch_norm, fill in rest of bn params
-                    if module.running_mean is not None:
-                        product_name = name + '.running_mean'
-                        self._create_and_add_param_product_if_not_exists(op, product_name,
-                                                                         list(module.running_mean.shape))
-                    if module.running_var is not None:
-                        product_name = name + '.running_var'
-                        self._create_and_add_param_product_if_not_exists(op, product_name,
-                                                                         list(module.running_var.shape))
+                if isinstance(op.get_module(), tuple(aimet_torch.utils.modules_to_treat_as_leaf)):
+                    for child_name, child_module in op.get_module().named_children():
+                        self._create_param_products_helper(op, child_module, name + "." + child_name,
+                                                           self.get_op_type(type(child_module)))
+                else:
+                    self._create_param_products_helper(op, module, name, op.type)
+
+    def _create_param_products_helper(self, conn_graph_op: Op, module: torch.nn.Module, module_name: str, op_type: str):
+        """
+        Helper to create param products for ops like convolution, batch norm, and linear if they don't exist yet
+        :param conn_graph_op: Connected graph whose param products need to be added
+        :param module: module of type torch.nn.Module to be used to create the param products.
+        There can be several modules in a single connected graph op.
+        :param module_name: name of the module.
+        :param op_type: type (str) of the op which is stored in the connected graph
+        """
+        if op_type in ['Conv', 'ConvTranspose', 'BatchNormalization', 'Gemm']:
+            if module.weight is not None:
+                product_name = module_name + '.weight'
+                self._create_and_add_param_product_if_not_exists(conn_graph_op, product_name, list(module.weight.shape))
+            if module.bias is not None:
+                product_name = module_name + '.bias'
+                self._create_and_add_param_product_if_not_exists(conn_graph_op, product_name, list(module.bias.shape))
+        if op_type == 'BatchNormalization':
+            # If batch_norm, fill in rest of bn params
+            if module.running_mean is not None:
+                product_name = module_name + '.running_mean'
+                self._create_and_add_param_product_if_not_exists(conn_graph_op, product_name,
+                                                                 list(module.running_mean.shape))
+            if module.running_var is not None:
+                product_name = module_name + '.running_var'
+                self._create_and_add_param_product_if_not_exists(conn_graph_op, product_name,
+                                                                 list(module.running_var.shape))
+
+    def _remove_inputs_for_ops(self):
+        """
+        Remove certain constant inputs for certain ops.
+        """
+
+        for op in self._ops.values():
+            num_expected_inputs, start_from_front = op_inputs_dict.get(op.type, (None, None))
+            if num_expected_inputs is not None and len(op.inputs) > num_expected_inputs:
+                if start_from_front:
+                    # Remove trailing inputs so that only num_expected_inputs remains
+                    inputs_to_remove = op.inputs[num_expected_inputs:]
+                    inputs_to_keep = op.inputs[:num_expected_inputs]
+                else:
+                    # Remove leading inputs so that only num_expected_inputs remains
+                    inputs_to_remove = op.inputs[:-num_expected_inputs]
+                    inputs_to_keep = op.inputs[-num_expected_inputs:]
+
+                for inp in inputs_to_remove:
+                    del self._products[inp.name]
+                op.inputs = inputs_to_keep
 
     def _create_and_add_param_product_if_not_exists(self, op: Op, product_name: str, shape: List[int]):
         """
@@ -1181,14 +1242,15 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         :return: Boolean whether recursive parsing needed or not. If needed returns True, False otherwise.
         """
         recursive_parsing_needed = True
-        if is_torch_nn_leaf_module(module) or is_custom_leaf_module(module, self.get_all_aten_nodes(module,
-                                                                                                    module_to_jit_trace)):
+        if is_torch_nn_leaf_module(module) or \
+                is_custom_leaf_module(module, self.get_all_aten_nodes(module, module_to_jit_trace)) or \
+                isinstance(module, tuple(aimet_torch.utils.modules_to_treat_as_leaf)):
             recursive_parsing_needed = False
 
         return recursive_parsing_needed
 
     @staticmethod
-    def _is_multi_input_op(module: torch.nn.Module):
+    def _is_multi_input_op_to_parse(module: torch.nn.Module):
         """
         Check whether the module is an multi input op to parse.
 
@@ -1196,8 +1258,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         :return: True if module is an multi input op to parse.
         """
 
-        return isinstance(module, (elementwise_ops.Add, elementwise_ops.Multiply, elementwise_ops.Subtract,
-                                   elementwise_ops.Divide))
+        return isinstance(module, tuple(MULTI_INPUT_OPS_TO_PARSE))
 
     @staticmethod
     def _generate_trace_lookup_table(model: torch.nn.Module,

@@ -322,10 +322,14 @@ class QuantizationSimModel(tf.keras.Model):
                                                                               Dict[str, Union[str, int, float]]]:
         """
         Get encoding dict for a tensor quantizer.
+
         :param quantizer: Quantizer to get encoding info from
         :return: Dictionary or List of dictionaries containing encodings info for the tensor quantizer
         """
-        quantizer_encodings = [quantizer.encoding] if not isinstance(quantizer, ParamPerChannelQuantizer) else quantizer.encoding
+        if not isinstance(quantizer, ParamPerChannelQuantizer) or quantizer.data_type == QuantizationDataType.float:
+            quantizer_encodings = [quantizer.encoding]
+        else:
+            quantizer_encodings = quantizer.encoding
         return [
             {
                 'min': encoding.min,
@@ -453,10 +457,6 @@ class QuantizationSimModel(tf.keras.Model):
             encodings_dict = self.get_encodings_dict()
             encoding_file_path = os.path.join(path, filename_prefix + '.encodings')
             save_json_yaml(encoding_file_path, encodings_dict)
-
-            # Keras magic under the hood that causes the 'Invalid Graph' error to go away
-            # TODO: Investigate what is actually fixing this issue.
-            _ = tf.keras.models.clone_model(self._model_without_wrappers)
 
     def _compute_and_set_parameter_encodings(self, ops_with_invalid_encodings: List):
         # pylint: disable=too-many-nested-blocks

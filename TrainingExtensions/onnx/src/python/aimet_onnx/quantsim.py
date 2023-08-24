@@ -128,7 +128,7 @@ class QuantizationSimModel:
         self._get_param_names()
         self._get_activations_to_quantize(dummy_input)
         self._add_quantization_nodes()
-        self.session = self._build_session(self.providers)
+        self.session = QuantizationSimModel.build_session(self.model.model, self.providers)
 
         quantsim_configurator = self._add_configuration_(config_file)
 
@@ -184,16 +184,16 @@ class QuantizationSimModel:
         :param dummy_input: Sample input to be run through the model
         """
         self.fill_activation_dtypes(dummy_input)
+        for node in self.model.graph().input:
+            name = node.name
+            if name not in self.activation_names and name not in self.param_names and self._is_op_quantizable(name):
+                self.activation_names.append(name)
         for node in self.model.nodes():
             if node.op_type not in op_types_to_ignore:
                 for name in node.output:
                     if name not in self.activation_names and name not in self.param_names and \
                             self._is_op_quantizable(name):
                         self.activation_names.append(name)
-        for node in self.model.graph().input:
-            name = node.name
-            if name not in self.activation_names and name not in self.param_names and self._is_op_quantizable(name):
-                self.activation_names.append(name)
         for node in self.model.graph().output:
             if node.name in self.activation_names:
                 node.name += '_updated'
@@ -220,7 +220,7 @@ class QuantizationSimModel:
         hooks = []
         for name in activations:
             hooks.append(add_hook_to_get_activation(self.model.model, name))
-        sess = self._build_session(self.providers)
+        sess = QuantizationSimModel.build_session(self.model.model, self.providers)
         outputs = sess.run(None, dummy_input)
         for idx in range(len(self.model.graph().output)):
             act_name = self.model.graph().output[idx].name
@@ -327,10 +327,12 @@ class QuantizationSimModel:
                                                           use_symmetric_encodings=self._use_symmetric_encodings
                                                           )
 
-    def _build_session(self, providers):
+    @staticmethod
+    def build_session(model: onnx_pb.ModelProto, providers: List):
         """
         Build and return onnxruntime inference session
 
+        :param model: onnx model
         :param providers: providers to execute onnxruntime
         """
         sess_options = SessionOptions()
@@ -339,7 +341,7 @@ class QuantizationSimModel:
         sess_options.register_custom_ops_library(shared_library)
         sess_options.graph_optimization_level = GraphOptimizationLevel.ORT_DISABLE_ALL
         session = InferenceSession(
-            path_or_bytes=self.model.model.SerializeToString(),
+            path_or_bytes=model.SerializeToString(),
             sess_options=sess_options,
             providers=providers,
         )
@@ -441,11 +443,9 @@ class QuantizationSimModel:
 
         save_json_yaml(encoding_file_path, encodings_dict)
 
-    def _remove_nodes_and_save_model(self, file_path):
+    def remove_quantization_nodes(self):
         """
-        Remove quantization nodes and save model to file
-
-        :param file_path: path to save onnx model
+        Remove quantization nodes
         """
         nodes_to_remove = []
         for node in self.model.nodes():
@@ -459,8 +459,6 @@ class QuantizationSimModel:
         for node in self.model.graph().output:
             node.name = node.name.replace('_updated', '')
 
-        self.model.save_model_to_file(file_path)
-
     def export(self, path: str, filename_prefix: str):
         """
         Compute encodings and export to files
@@ -469,7 +467,8 @@ class QuantizationSimModel:
         :param filename_prefix: filename to save encoding files
         """
         self._export_encodings(os.path.join(path, filename_prefix) + '.encodings')
-        self._remove_nodes_and_save_model(os.path.join(path, filename_prefix) + '.onnx')
+        self.remove_quantization_nodes()
+        self.model.save_model_to_file(os.path.join(path, filename_prefix) + '.onnx')
 
 
 def load_encodings_to_sim(quant_sim_model: QuantizationSimModel, onnx_encoding_path: str):

@@ -72,12 +72,6 @@ class AdaroundTensorQuantizer(TensorQuantizer):
         self._ch_axis = channel_axis
         self._cppOp = AimetTensorQuantizer.AimetTensorQuantizer(MAP_QUANT_SCHEME_TO_PYMO[quant_scheme])
 
-    def free(self):
-        """
-        Free the memory occupied by Adaround variable
-        """
-        self.alpha = None
-
     def quantize_dequantize(self, tensor: torch.Tensor, _) -> torch.Tensor:
         """
         Quantize-dequantize the tensor, using the saved encoding for this tensor
@@ -137,6 +131,8 @@ class AdaroundTensorQuantizer(TensorQuantizer):
         # same shape as the weight tensor
         if self.alpha is None:
             self._initialize_alpha(tensor, broadcasted_delta)
+        else:
+            self.alpha = self.alpha.to(tensor.device)
 
         # Scale the tensor
         tensor = torch.floor(tensor / broadcasted_delta)

@@ -39,6 +39,7 @@ import logging
 import json as json
 import os
 import shutil
+import tempfile
 import unittest.mock
 from packaging import version
 import numpy as np
@@ -52,6 +53,7 @@ from torchvision import models
 
 import aimet_common.libpymo as libpymo
 from aimet_common.defs import QuantScheme, QuantizationDataType, MAP_ROUND_MODE_TO_PYMO
+from aimet_common.quantsim_config.utils import get_path_for_per_channel_config
 from aimet_common.utils import AimetLogger
 from aimet_torch import transformer_utils, onnx_utils
 from aimet_torch import utils, elementwise_ops
@@ -2726,6 +2728,31 @@ class TestQuantizationSimStaticGrad:
         if os.path.exists(results_dir):
             shutil.rmtree(results_dir)
 
+    def test_export_to_onnx_direct(self):
+        if version.parse(torch.__version__) >= version.parse("1.13.0"):
+            onnx_utils.EXPORT_TO_ONNX_DIRECT = True
+            model = ModelWithTwoInputs()
+            dummy_input = (torch.rand(1, 1, 28, 28), torch.rand(1, 1, 28, 28))
+            sim = QuantizationSimModel(model, dummy_input)
+            sim.compute_encodings(lambda m, _: m(*dummy_input), None)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                sim.export(temp_dir, 'direct_onnx_export', dummy_input)
+
+                onnx_utils.EXPORT_TO_ONNX_DIRECT = False
+                sim.export(temp_dir, 'onnxsaver_export', dummy_input)
+
+                with open(os.path.join(temp_dir, 'direct_onnx_export.encodings')) as direct_onnx_json:
+                    direct_onnx_encodings = json.load(direct_onnx_json)
+                with open(os.path.join(temp_dir, 'onnxsaver_export.encodings')) as onnxsaver_json:
+                    onnxsaver_encodings = json.load(onnxsaver_json)
+
+                assert len(direct_onnx_encodings['activation_encodings']) == \
+                       len(onnxsaver_encodings['activation_encodings'])
+                assert len(direct_onnx_encodings['param_encodings']) == len(onnxsaver_encodings['param_encodings'])
+                direct_onnx_act_names = direct_onnx_encodings['activation_encodings'].keys()
+                onnxsaver_act_names = onnxsaver_encodings['activation_encodings'].keys()
+                assert direct_onnx_act_names != onnxsaver_act_names
+
 
 class TestQuantizationSimLearnedGrid:
 
@@ -4088,6 +4115,39 @@ class TestQuantizationSimLearnedGrid:
         model.train()
         for _ in range(3):
             inp = torch.randn(shape)
+            out = sim.model(inp)
+            out.sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+    @pytest.mark.parametrize(
+        'quant_scheme',
+        [QuantScheme.training_range_learning_with_tf_init,
+         QuantScheme.training_range_learning_with_tf_enhanced_init]
+    )
+    @pytest.mark.parametrize(
+        'config_file',
+        [None, get_path_for_per_channel_config()]
+    )
+    def test_module_with_list_input(self, quant_scheme, config_file):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        model = test_models.ModuleWithListInputModel()
+        model.eval()
+        model.to(device)
+
+        shape = (1, 32, 128)
+        dummy_inputs = torch.randn(shape, device=device)
+        sim = QuantizationSimModel(model,
+                                   dummy_input=dummy_inputs,
+                                   quant_scheme=quant_scheme,
+                                   config_file=config_file)
+        sim.compute_encodings(forward_pass_callback=lambda m, _: m(dummy_inputs),
+                              forward_pass_callback_args=None)
+
+        sim.model.train()
+        optimizer = torch.optim.SGD(sim.model.parameters(), lr=0.05, momentum=0.5)
+        for _ in range(3):
+            inp = torch.randn(shape, device=device)
             out = sim.model(inp)
             out.sum().backward()
             optimizer.step()

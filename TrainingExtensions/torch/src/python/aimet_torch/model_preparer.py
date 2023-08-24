@@ -187,6 +187,9 @@ functional_with_special_handling = {
 
 # In this functional --> module map, corresponding custom module is of type torch.nn and uses stateless API.
 functional_with_stateless_api = {
+    '_pad'                      : elementwise_ops.Pad,
+    'pad'                      : elementwise_ops.Pad,
+    'sum'                       : elementwise_ops.Sum,
     'add'                       : elementwise_ops.Add,
     'subtract'                  : elementwise_ops.Subtract,
     'sub'                       : elementwise_ops.Subtract,
@@ -573,13 +576,14 @@ def _insert_node_for_new_module(traced_model: torch.fx.GraphModule,
     """
     with traced_model.graph.inserting_after(node):
         if functional_name:
-            if functional_name in functional_with_special_handling.keys():
+            if functional_name in functional_with_special_handling:
                 new_node = special_handler_functions[functional_name]['node_fn'](traced_model, module_qualified_name, node)
-            elif functional_name in functional_with_stateless_api.keys():
-                merged_args = _merge_args_and_kwargs(node)
-                new_node = traced_model.graph.call_module(module_qualified_name, args=tuple(merged_args))
-            else:
+            elif functional_name in functional_with_stateless_api:
+                new_node = traced_model.graph.call_module(module_qualified_name, args=node.args, kwargs=node.kwargs)
+            elif functional_name in functional_with_stateful_api:
                 new_node = traced_model.graph.call_module(module_qualified_name, args=node.args)
+            else:
+                raise ValueError("Unsupported module: {}".format(functional_name))
         else:
             new_node = traced_model.graph.call_module(module_qualified_name, args=node.args)
 
@@ -617,14 +621,14 @@ def _create_module_for_functional_node(node: torch.fx.node, functional_name: str
     :return: New module
     """
     # Instantiate new module from lookup
-    if functional_name in functional_with_stateful_api.keys():
+    if functional_name in functional_with_stateful_api:
         module = functional_with_stateful_api[functional_name]()
         # Set the parameters for module from node.kwargs
         for key, value in node.kwargs.items():
             setattr(module, key, value)
-    elif functional_name in functional_with_special_handling.keys():
+    elif functional_name in functional_with_special_handling:
         module = special_handler_functions[functional_name]['module_fn'](node)
-    elif functional_name in functional_with_stateless_api.keys():
+    elif functional_name in functional_with_stateless_api:
         module = functional_with_stateless_api[functional_name]()
     else:
         raise ValueError("Unsupported module: {}".format(functional_name))
@@ -690,20 +694,6 @@ def prepare_pt_transformer_for_quantsim(transformer_model: torch.nn.Module):
 
         if isinstance(module, torch.nn.TransformerDecoderLayer) and not isinstance(module.activation, torch.nn.Module):
             module.activation = get_module_for_activation_fn(module.activation)
-
-
-def _merge_args_and_kwargs(node: torch.fx.node) -> List:
-    """
-    Merge node's args and kwargs
-    :param node: Torch FX node in the graph whose args and kwargs to be merged.
-    :return: List of merged args.
-    """
-    merged_args = []
-    for arg in node.args:
-        merged_args.append(arg)
-    for arg in node.kwargs.values():
-        merged_args.append(arg)
-    return merged_args
 
 
 def _get_info_for_functional_node(traced_model: torch.fx.GraphModule,

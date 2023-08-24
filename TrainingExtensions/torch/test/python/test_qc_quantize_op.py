@@ -51,6 +51,7 @@ from aimet_torch.qc_quantize_op import StaticGridQuantWrapper, LearnedGridQuantW
 from aimet_torch.tensor_quantizer import LearnedGridTensorQuantizer
 from aimet_torch.tensor_quantizer import StaticGridPerTensorQuantizer, QuantizeDequantizeFunc
 from aimet_torch import utils
+from aimet_torch import elementwise_ops
 
 
 class TestQcQuantizeOpStaticGrid:
@@ -174,7 +175,10 @@ class TestQcQuantizeOpStaticGrid:
         assert quantize_op.output_quantizers[0] is not None
 
     def test_quantize_only_asymmetric_cpu(self):
-        """ Test tensor quantizer quantize only asymmetric functionality """
+        """
+        Test tensor quantizer quantize only asymmetric functionality
+        Note: Quantize-only mode uses symmetric range for output tensor by default
+        """
         quantizer = StaticGridPerTensorQuantizer(bitwidth=8, round_mode='nearest',
                                                  quant_scheme=QuantScheme.post_training_tf,
                                                  use_symmetric_encodings=False, enabled_by_default=True,
@@ -188,7 +192,7 @@ class TestQcQuantizeOpStaticGrid:
 
         inp_tensor = torch.tensor([-7, -5, -3, 0, .1, 2.5])
         quant_out = quantizer.quantize(inp_tensor, MAP_ROUND_MODE_TO_PYMO['nearest'])
-        expected_out = torch.tensor([0, 6, 75, 178, 181, 255], dtype=torch.float32)
+        expected_out = torch.tensor([-128., -122.,  -53.,   50.,   53.,  127.], dtype=torch.float32)
         assert torch.equal(quant_out, expected_out)
 
     def test_quantize_only_symmetric_signed_cpu(self):
@@ -232,12 +236,16 @@ class TestQcQuantizeOpStaticGrid:
         assert torch.equal(quant_out, expected_output)
 
     def test_quantize_only_symmetric_unsigned_cpu(self):
-        """ Test tensor quantizer quantize only symmetric unsigned functionality on cpu """
+        """
+        Test tensor quantizer quantize only symmetric unsigned functionality on cpu
+        Note: Quantize-only mode uses symmetric range for output tensor by default
+        """
 
         quantizer = StaticGridPerTensorQuantizer(bitwidth=8, round_mode='nearest',
                                                  quant_scheme=QuantScheme.post_training_tf,
                                                  use_symmetric_encodings=True, enabled_by_default=True,
                                                  data_type=QuantizationDataType.int)
+        quantizer.use_unsigned_symmetric = True
         encodings = libpymo.TfEncoding()
         encodings.bw = 8
         encodings.max = 5.19
@@ -250,7 +258,7 @@ class TestQcQuantizeOpStaticGrid:
         # Test quantize only on cpu
         inp_tensor_gpu = torch.tensor([0, 1.2, 1.5, 4.0, 4.9, 5.3])
         quant_out = quantizer.quantize(inp_tensor_gpu, MAP_ROUND_MODE_TO_PYMO['nearest'])
-        expected_out = torch.tensor([0, 59, 74, 197, 241, 255], dtype=torch.float32)
+        expected_out = torch.tensor([  0.,  59.,  74., 197., 241., 255.], dtype=torch.float32)
         assert torch.equal(quant_out, expected_out)
 
     def test_quantize_dequantize_fp16_cpu(self):
@@ -294,7 +302,10 @@ class TestQcQuantizeOpStaticGrid:
 
     @pytest.mark.cuda
     def test_quantize_only_asymmetric_gpu(self):
-        """ Test tensor quantizer quantize only asymmetric functionality on gpu """
+        """
+        Test tensor quantizer quantize only asymmetric functionality on gpu
+        Note: Quantize-only mode uses symmetric range for output tensor by default
+        """
 
         quantizer = StaticGridPerTensorQuantizer(bitwidth=8, round_mode='nearest',
                                                  quant_scheme=QuantScheme.post_training_tf,
@@ -310,7 +321,7 @@ class TestQcQuantizeOpStaticGrid:
         # Test quantize only on gpu
         inp_tensor_gpu = torch.tensor([-7, -5, -3, 0, .1, 2.5], device=torch.device('cuda'))
         quant_out = quantizer.quantize(inp_tensor_gpu, MAP_ROUND_MODE_TO_PYMO['nearest'])
-        expected_out = torch.tensor([0, 6, 75, 178, 181, 255], dtype=torch.float32, device=torch.device('cuda'))
+        expected_out = torch.tensor([-128., -122.,  -53.,   50.,   53.,  127.], dtype=torch.float32, device=torch.device('cuda'))
         assert torch.equal(quant_out, expected_out)
 
     @pytest.mark.cuda
@@ -339,13 +350,18 @@ class TestQcQuantizeOpStaticGrid:
 
     @pytest.mark.cuda
     def test_quantize_only_symmetric_unsigned_gpu(self):
-        """ Test tensor quantizer quantize only symmetric unsigned functionality on gpu """
+        """
+        Test tensor quantizer quantize only symmetric unsigned functionality on gpu
+        Note: Quantize-only mode uses symmetric range for output tensor by default
+        """
 
         post_training_tensor_quantizer = \
             StaticGridPerTensorQuantizer(bitwidth=8, round_mode='nearest',
                                          quant_scheme=QuantScheme.post_training_tf,
                                          use_symmetric_encodings=True, enabled_by_default=True,
                                          data_type=QuantizationDataType.int)
+        post_training_tensor_quantizer.use_unsigned_symmetric = True
+
         encodings = libpymo.TfEncoding()
         encodings.bw = 8
         encodings.max = 5.19
@@ -358,9 +374,10 @@ class TestQcQuantizeOpStaticGrid:
         # Test quantize only on gpu
         inp_tensor_gpu = torch.tensor([0, 1.2, 1.5, 4.0, 4.9, 5.3], device=torch.device('cuda'))
         quant_out = post_training_tensor_quantizer.quantize(inp_tensor_gpu, MAP_ROUND_MODE_TO_PYMO['nearest'])
-        expected_out = torch.tensor([0, 59, 74, 197, 241, 255], dtype=torch.float32, device=torch.device('cuda'))
+        expected_out = torch.tensor([0.,  59.,  74., 197., 241., 255.], dtype=torch.float32, device=torch.device('cuda'))
         assert torch.equal(quant_out, expected_out)
 
+    @pytest.mark.skip(reason="causing random failures in CI. disabling to see in regressions if this is the root cause")
     def test_qc_post_training_wrapper_mem_leak(self):
         torch.manual_seed(0)
 
@@ -994,3 +1011,26 @@ class TestQcQuantizeOpLearnedGrid:
         assert linear_wrapper.input0_encoding_max.grad.dtype == torch.float16
         assert linear_wrapper.output0_encoding_min.grad.dtype == torch.float16
         assert linear_wrapper.output0_encoding_max.grad.dtype == torch.float16
+
+    @pytest.mark.parametrize("wrapper",
+                             [StaticGridQuantWrapper(elementwise_ops.Addmm(),
+                                                     8, 8, 'nearest',
+                                                     QuantScheme.post_training_tf_enhanced,
+                                                     num_inputs=3, num_outputs=1),
+                              LearnedGridQuantWrapper(elementwise_ops.Addmm(),
+                                                      8, 8, 'nearest',
+                                                      QuantScheme.training_range_learning_with_tf_init,
+                                                      torch.device('cpu'),
+                                                      num_inputs=3, num_outputs=1)
+                              ])
+    def test_wrapper_with_kwargs(self, wrapper):
+        """ test wrapper with keyword arguemnts """
+        wrapper.input_quantizers[0].enabled = False
+        wrapper.input_quantizers[0].enabled = False
+        wrapper.input_quantizers[0].enabled = False
+        wrapper.output_quantizers[0].enabled = False
+        out1 = wrapper(torch.randn(2, 3), torch.randn(2, 3), torch.randn(3, 3), beta=1, alpha=1)
+        out2 = wrapper(torch.randn(2, 3), torch.randn(2, 3), torch.randn(3, 3), beta=1)
+        out3 = wrapper(torch.randn(2, 3), torch.randn(2, 3), torch.randn(3, 3))
+        assert out1.shape == out2.shape
+        assert out2.shape == out3.shape

@@ -39,10 +39,12 @@
 """ Common Utilities for tf 2 keras """
 import errno
 import os
-from typing import Union, List, Dict, Tuple, AnyStr, Callable
+from typing import Callable, Union, List, Dict, Tuple, AnyStr
+
 import tensorflow as tf
 from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_from_session_graph
 from tensorflow.python.framework.graph_util_impl import remove_training_nodes
+from packaging import version
 
 import aimet_common.libpymo as libpymo
 from aimet_common.utils import AimetLogger, log_with_error_and_assert_if_false
@@ -95,6 +97,22 @@ def is_lambda_operator(layer: tf.keras.layers.Layer) -> bool:
     if 'function' in config:
         return config['function'] in lambda_operators
     return False
+
+
+def is_a_tf_op_lambda_layer(layer: tf.keras.layers.Layer) -> bool:
+    """
+    Check if a layer is a TFOpLambda layer. These occur typically when a user is using built in TensorFlow operations
+    while build a Keras model. Some examples are tf.matmul, tf.transpose, and tf.concat
+    :param layer: Layer to check
+    :return True if the layer is a TFOpLambda layer, otherwise False.
+    """
+    if version.parse(tf.version.VERSION) >= version.parse("2.10"):
+        # pylint: disable=import-error
+        from keras.layers.core.tf_op_layer import TFOpLambda
+    else:
+        from tensorflow.python.keras.layers.core import TFOpLambda
+
+    return isinstance(layer, TFOpLambda)
 
 
 def module_to_name_map(cur_layer: (tf.keras.Model, tf.keras.layers.Layer)) \
@@ -621,6 +639,45 @@ def log_param_quantizer_wrapper_details(layer, axis_handling=None, num_output_ch
                       axis_handling, num_output_channels)
 
 
+def set_keras_backend_version_to_v2(func_to_run_before_setting_back_to_v2: Callable):
+    """
+    Special function for setting backend Keras specifics to V2 after converting a model to a frozen pb.
+
+    :param func_to_run_before_setting_back_to_v2: Function to run before setting the Keras backend to v2.
+    """
+    # Versioning changes are taken from Tensorflow backend in the link below. Essentially, the Functional Keras class
+    # has certain parts moved to v1 once calling things like tf.Graph. Here, we set back to the v2 version.
+    # https://github.com/tensorflow/tensorflow/blob/739d01fc1a4e8dc0fd95b8aed0f9dd107451e1b6/tensorflow/python/keras/utils/version_utils.py#L48-L63
+
+    # Imports kept inside the function to minimize confusion and to not be accidentally used anywhere else
+    def wrap(*args, **kwargs):
+        func_to_run_before_setting_back_to_v2(*args, **kwargs)
+        if version.parse(tf.version.VERSION) >= version.parse("2.10"):
+            # pylint: disable=import-error
+            from keras.engine.functional import Functional
+            import keras.engine.base_layer as base_layer
+            import keras.engine.base_layer_v1 as base_layer_v1
+
+            import keras.engine.training as training
+            import keras.engine.training_v1 as training_v1
+
+            from keras.utils.version_utils import swap_class
+        else:
+            from tensorflow.python.keras.engine.functional import Functional
+            import tensorflow.python.keras.engine.base_layer as base_layer
+            import tensorflow.python.keras.engine.base_layer_v1 as base_layer_v1
+
+            import tensorflow.python.keras.engine.training as training
+            import tensorflow.python.keras.engine.training_v1 as training_v1
+
+            from tensorflow.python.keras.utils.version_utils import swap_class
+
+        _ = swap_class(Functional, base_layer.Layer, base_layer_v1.Layer, use_v2=True)
+        _ = swap_class(Functional, training.Model, training_v1.Model, use_v2=True)
+    return wrap
+
+
+@set_keras_backend_version_to_v2
 def convert_h5_model_to_pb_model(h5_model_path: AnyStr, custom_objects: Dict = None):
     """
     This utility function converts a h5_model from Keras into a frozen pb for consumption by SNPE/QNN
@@ -628,14 +685,16 @@ def convert_h5_model_to_pb_model(h5_model_path: AnyStr, custom_objects: Dict = N
     :param custom_objects: If there are custom objects to load, Keras needs a dict of them to map them
     """
 
+    supported_file_types = ['h5', 'hdf5']
+
     # Function for validating if the file exist and is a h5
     def validate_model_path() -> Tuple[str, str]:
         if not os.path.exists(h5_model_path):
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), h5_model_path)
 
         model_name_split = os.path.basename(h5_model_path).split('.')
-        if model_name_split[1] != 'h5':
-            raise ValueError("File must be a h5 model.")
+        if model_name_split[-1] not in supported_file_types:
+            raise ValueError(f"File must be of types {supported_file_types}.")
 
         model_name = model_name_split[0] + '_converted.pb'
         save_path = os.path.dirname(h5_model_path)
@@ -681,4 +740,4 @@ def convert_h5_model_to_pb_model(h5_model_path: AnyStr, custom_objects: Dict = N
                                           [out.op.name for out in model.outputs])
             tf.io.write_graph(frozen_graph, save_path, model_name, as_text=False)
 
-            _logger.info("Success. The converted model is located at %s saved as %s", save_path, model_name)
+    _logger.info("Success. The converted model is located at %s saved as %s", save_path, model_name)

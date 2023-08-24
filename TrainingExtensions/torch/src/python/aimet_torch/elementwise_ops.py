@@ -39,6 +39,7 @@
 """ Custom modules for functional operations defined under torch and torch.nn.functional packages """
 
 from typing import Callable, Any, Tuple, Union
+import itertools
 import torch
 import torch.nn
 import torchvision
@@ -124,6 +125,8 @@ TopK = create_wrapper_module('TopK', torch.topk)
 Shape = create_wrapper_module('Shape', torch.Tensor.size)
 Tile = create_wrapper_module('Tile', torch.tile)
 ElementwiseUnarySign = create_wrapper_module('ElementwiseUnarySign', torch.sign)
+Baddbmm = create_wrapper_module('Baddbmm', torch.baddbmm)
+Addmm = create_wrapper_module('Addmm', torch.addmm)
 
 # modules for functional operations defined under torch.nn.functional package
 Interpolate = create_wrapper_module('Interpolate', torch.nn.functional.interpolate)
@@ -145,8 +148,11 @@ class Add(torch.nn.Module):
         """
         Forward-pass routine for add op
         """
-        return x + y
-
+        if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+            out = torch.add(x, y)
+        else:
+            out = x + y
+        return out
 
 class Multiply(torch.nn.Module):
     """ Multiply module for a functional multiply"""
@@ -156,7 +162,11 @@ class Multiply(torch.nn.Module):
         """
         Forward-pass routine for multiply op
         """
-        return x * y
+        if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+            out = torch.mul(x, y)
+        else:
+            out = x * y
+        return out
 
 
 # modules for functional requiring special handling
@@ -210,28 +220,6 @@ class CustomSiLU(torch.nn.Module):
         Forward-pass routine for custom SiLU
         """
         return self.mul(x, self.sigmoid(x))
-
-
-class Baddbmm(torch.nn.Module):
-    """Custom module for a functional baddbmm"""
-    @staticmethod
-    def forward(*args) -> torch.Tensor:
-        """
-        Forward-pass routine for torch.baddbmm
-        """
-        tensor, batch1, batch2, beta, alpha = args
-        return tensor.baddbmm(batch1, batch2, beta=beta, alpha=alpha)
-
-
-class Addmm(torch.nn.Module):
-    """Custom module for a functional baddbmm"""
-    @staticmethod
-    def forward(*args) -> torch.Tensor:
-        """
-        Forward-pass routine for torch.baddbmm
-        """
-        tensor, mat1, mat2, beta, alpha = args
-        return tensor.addmm(mat1, mat2, beta=beta, alpha=alpha)
 
 
 class StridedSlice(torch.nn.Module):
@@ -317,9 +305,14 @@ class ScatterND(torch.nn.Module):
         Forward-pass routine for ScatterND op
         """
         output = torch.clone(data)
-        update_indices = indices.size(dim=0)
 
-        for idx in range(update_indices):
+        # Get multidimensional indices to iterate over the first N-1 dimensions of the indices variable
+        # as the last dimension of the indices variable is partial index into data
+        update_indices = indices.size()[:-1]
+        update_indices = itertools.product(*(range(index) for index in update_indices))
+
+        # For each index, update output using the updates variable
+        for idx in update_indices:
             idx_list = tuple(indices[idx].tolist())
             output[idx_list] = updates[idx]
 
@@ -412,3 +405,63 @@ class GatherNd(torch.nn.Module):
         if output_data_buffer[0].dim() == 0:
             return torch.tensor(output_data_buffer).reshape(output_shape)
         return torch.cat(output_data_buffer).reshape(output_shape)
+
+
+class ScatterElements(torch.nn.Module):
+    """ ScatterElements op implementation """
+    def __init__(self, dim: int, reduce: str = None):
+
+        super().__init__()
+
+        self.dim = dim
+        self.reduce = reduce
+
+    def forward(self, x: Union[torch.Tensor, list],
+                index: Union[torch.Tensor, list],
+                src: Union[torch.Tensor, list]):
+        """
+        Forward-pass routine for ScatterElements op
+        """
+        if isinstance(index, list):
+            index = torch.tensor(index, dtype=torch.int64)
+        if isinstance(src, list):
+            src = torch.tensor(src)
+        if isinstance(x, list):
+            x = torch.tensor(x, dtype=src.dtype)
+
+        if self.reduce:
+            if isinstance(src, torch.Tensor):
+                return x.scatter_reduce_(self.dim, index, src, self.reduce)
+            # If src is a single float value
+            return x.scatter_(self.dim, index, src, reduce=self.reduce)
+
+        return x.scatter_(self.dim, index, src)
+
+
+class OneHot(torch.nn.Module):
+    """ Custom module for ONNX OneHot  """
+
+    def __init__(self, num_classes: int, off_value: Union[int, float], on_value: Union[int, float]):
+        super().__init__()
+        self.num_classes = num_classes
+        self.off_value = off_value
+        self.on_value = on_value
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward-pass routine for OneHot
+        """
+        out = torch.nn.functional.one_hot(inputs, self.num_classes)
+        if self.off_value != 0 or self.on_value != 1:
+            out = out * (self.on_value - self.off_value) + self.off_value
+        return out
+
+
+class Expand(torch.nn.Module):
+    """Custom module for a Expand op"""
+    @staticmethod
+    def forward(tensor: torch.Tensor, *args) -> torch.Tensor:
+        """
+        Forward-pass routine for Expand op
+        """
+        return tensor.expand(*args)
