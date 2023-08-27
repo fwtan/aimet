@@ -215,6 +215,10 @@ functional_with_stateless_api = {
     'baddbmm'                   : elementwise_ops.Baddbmm,
     'cumsum'                    : elementwise_ops.CumSum,
     'masked_fill'               : elementwise_ops.MaskedFill,
+    'sqrt'                      : elementwise_ops.Sqrt,
+    'neg'                       : elementwise_ops.Neg,
+    'transpose'                 : elementwise_ops.Transpose,
+    'reshape'                   : elementwise_ops.Reshape,
 }
 
 

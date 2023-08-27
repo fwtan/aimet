@@ -1022,7 +1022,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                     op.output.shape = op.output_shape
                 elif op.output_shape is None:
                     op.output_shape = op.output.shape
-                elif op.output.shape != op.output_shape:
+                elif (op.output.shape != op.output_shape) and (op.output.shape != list(op.output_shape)):
                     logger.debug('Mismatch between existing shape %s for product %s and output shape %s for '
                                  'output of op %s', op.output.shape, op.output.name, op.output_shape,
                                  op.name)
