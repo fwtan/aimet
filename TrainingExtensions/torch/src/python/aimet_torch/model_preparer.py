@@ -219,6 +219,7 @@ functional_with_stateless_api = {
     'neg'                       : elementwise_ops.Neg,
     'transpose'                 : elementwise_ops.Transpose,
     'reshape'                   : elementwise_ops.Reshape,
+    'normalize'                 : elementwise_ops.Normalize,
 }
 
 
