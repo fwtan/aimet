@@ -143,7 +143,7 @@ class QuantizationSimModel:
                  rounding_mode: str = 'nearest', default_output_bw: int = 8, default_param_bw: int = 8,
                  in_place: bool = False, config_file: str = None,
                  default_data_type: QuantizationDataType = QuantizationDataType.int,
-                 master_opdef_file: str = None, backend_opdef_file: str = None):
+                 master_opdef_file: str = None, backend_opdef_files: List[str] = None):
         """
         Constructor for QuantizationSimModel.
 
@@ -163,7 +163,9 @@ class QuantizationSimModel:
                                  Note that the mode default_data_type=QuantizationDataType.float is only supported with
                                  default_output_bw=16 and default_param_bw=16
         :param master_opdef_file: Path to xml file for master ops definition
-        :param backend_opdef_file: Path to xml file for backend ops definition
+        :param backend_opdef_files: List of paths to xml file for backend ops definition
+                                    The bitwidth, datatype applied in case of no matching found
+                                    will be taken according to the order of xml provided
         """
         # Perform sanity checks on inputs
         validate_quantsim_inputs(quant_scheme, rounding_mode, default_output_bw, default_param_bw,
@@ -215,12 +217,12 @@ class QuantizationSimModel:
         # pylint: disable=protected-access
         self._hw_version = quantsim_configurator._get_hw_version()
 
-        if master_opdef_file is not None and backend_opdef_file is not None:
+        if master_opdef_file is not None and backend_opdef_files is not None:
             try:
                 from aimet_common.backend_aware_quantsim_utility import populate_backend_info, QuantsimInfo
                 quantsim_info = QuantsimInfo(self._default_output_bw, self._default_param_bw, default_data_type)
                 self._supported_kernels = populate_backend_info(self.model, quantsim_configurator.get_module_names(),
-                                                                master_opdef_file, backend_opdef_file, quantsim_info)
+                                                                master_opdef_file, backend_opdef_files, quantsim_info)
             except ImportError:
                 raise ImportError('Modules for backend aware quantization not found.')
         else:
@@ -510,6 +512,97 @@ class QuantizationSimModel:
                                                         onnx_node_to_io_tensor_map, valid_param_set,
                                                         excluded_layer_names, propagate_encodings,
                                                         quantizer_args=quantizer_args)
+
+    def save_encodings_to_json(self, path: str, filename_prefix: str):
+        """
+        Save encodings in the model to json.
+
+        :param path: Path to save file
+        :param filename_prefix: Filename to use for saved file
+        """
+        activation_encodings = {}
+        param_encodings = {}
+        for layer_name, layer in QuantizationSimModel._get_qc_quantized_layers(self.model):
+            if isinstance(layer.input_quantizers, list):
+                for index, quantizer in enumerate(layer.input_quantizers):
+                    self._save_activation_encoding(layer_name, index, quantizer, QUANTIZER_TYPE_INPUT,
+                                                   activation_encodings)
+            else:
+                for quantizer_name, quantizer in layer.input_quantizers.items():
+                    self._save_activation_encoding(layer_name, quantizer_name, quantizer, QUANTIZER_TYPE_INPUT,
+                                                   activation_encodings)
+
+            if isinstance(layer.output_quantizers, list):
+                for index, quantizer in enumerate(layer.output_quantizers):
+                    self._save_activation_encoding(layer_name, index, quantizer, QUANTIZER_TYPE_OUTPUT,
+                                                   activation_encodings)
+            else:
+                for quantizer_name, quantizer in layer.output_quantizers.items():
+                    self._save_activation_encoding(layer_name, quantizer_name, quantizer, QUANTIZER_TYPE_OUTPUT,
+                                                   activation_encodings)
+
+            for orig_param_name, param_quantizer in layer.param_quantizers.items():
+                self._save_param_encoding(layer_name, orig_param_name, param_quantizer, param_encodings)
+
+        encodings_dict = {'activation_encodings': activation_encodings, 'param_encodings': param_encodings}
+        with open(os.path.join(path, filename_prefix + '.json'), 'w') as encoding_json:
+            json.dump(encodings_dict, encoding_json, sort_keys=True, indent=4)
+
+    @staticmethod
+    def _save_activation_encoding(layer_name: str, quantizer_identifier: Union[str, int],
+                                  quantizer: Union[StaticGridTensorQuantizer, LearnedGridTensorQuantizer],
+                                  quantizer_type: str, activation_encodings: Dict):
+        """
+        Save activation encoding into a dictionary.
+
+        :param layer_name: Name of layer
+        :param quantizer_identifier: Identifier for the quantizer. Typically either an index or quantizer name
+        :param quantizer: Quantizer to save encoding for
+        :param quantizer_type: 'input' or 'output' depending on position of the quantizer
+        :param activation_encodings: Dictionary to save activation encoding to
+        """
+        if not quantizer.enabled:
+            return
+
+        quantizer_encoding = _get_encoding_by_quantizer(quantizer)
+        encoding = QuantizationSimModel._create_encoding_dict(quantizer_encoding,
+                                                              quantizer,
+                                                              propagate_encodings=False)
+        if layer_name not in activation_encodings:
+            activation_encodings[layer_name] = {}
+        if quantizer_type not in activation_encodings[layer_name]:
+            activation_encodings[layer_name][quantizer_type] = {}
+        activation_encodings[layer_name][quantizer_type][quantizer_identifier] = encoding
+
+    @staticmethod
+    def _save_param_encoding(layer_name: str, param_name: str,
+                             param_quantizer: Union[StaticGridTensorQuantizer, LearnedGridTensorQuantizer],
+                             param_encodings: Dict):
+        """
+        Save param encoding into a dictionary.
+
+        :param layer_name: Name of layer
+        :param param_name: Name of the parameter
+        :param param_quantizer: Quantizer to save encoding for
+        :param param_encodings: Dictionary to save param encoding to
+        """
+        if not param_quantizer.enabled:
+            return
+
+        param_name = layer_name + '.' + param_name
+        if isinstance(param_quantizer.encoding, Iterable):
+            param_encodings[param_name] = []
+            quantizer_encoding = _get_encoding_by_quantizer(param_quantizer)
+            for encoding in quantizer_encoding:
+                enc_dict = QuantizationSimModel._create_encoding_dict(encoding,
+                                                                      param_quantizer,
+                                                                      propagate_encodings=False)
+                param_encodings[param_name].append(enc_dict)
+        else:
+            quantizer_encoding = _get_encoding_by_quantizer(param_quantizer)
+            enc_dict = QuantizationSimModel._create_encoding_dict(quantizer_encoding, param_quantizer,
+                                                                  propagate_encodings=False)
+            param_encodings[param_name] = [enc_dict]
 
     def exclude_layers_from_quantization(self, layers_to_exclude: List[torch.nn.Module]):
         """
