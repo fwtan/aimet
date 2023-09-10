@@ -40,9 +40,10 @@
 
 from typing import Callable, Any, Tuple, Union
 import itertools
+import torchvision
 import torch
 import torch.nn
-import torchvision
+
 
 
 def forward_function_wrapper(functional: Callable) -> Any:
@@ -127,6 +128,8 @@ Tile = create_wrapper_module('Tile', torch.tile)
 ElementwiseUnarySign = create_wrapper_module('ElementwiseUnarySign', torch.sign)
 Baddbmm = create_wrapper_module('Baddbmm', torch.baddbmm)
 Addmm = create_wrapper_module('Addmm', torch.addmm)
+RSqRt = create_wrapper_module('RSqrt', torch.rsqrt)
+Square = create_wrapper_module('Square', torch.square)
 Transpose = create_wrapper_module('Transpose', torch.transpose)
 
 # modules for functional operations defined under torch.nn.functional package
@@ -305,6 +308,9 @@ class ScatterND(torch.nn.Module):
         """
         Forward-pass routine for ScatterND op
         """
+        if torch.jit.is_tracing():
+            return data
+
         output = torch.clone(data)
 
         # Get multidimensional indices to iterate over the first N-1 dimensions of the indices variable
@@ -391,6 +397,9 @@ class GatherNd(torch.nn.Module):
             batch_dims_shape + list(indices.shape)[self.batch_dims:-1]
             if (indices.shape[-1] == data_rank - self.batch_dims)
             else batch_dims_shape + list(indices.shape)[self.batch_dims:-1] + list(data.shape)[self.batch_dims + indices.shape[-1]:])
+
+        if torch.jit.is_tracing():
+            return torch.zeros(*output_shape)
 
         output_data_buffer = []
 
