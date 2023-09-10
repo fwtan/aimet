@@ -135,6 +135,12 @@ map_torch_types_to_onnx = {
     elementwise_ops.DepthToSpaceDCRMode: ['DepthToSpace'],
     elementwise_ops.MaxPool2d: ['MaxPool'],
     elementwise_ops.Split: ['Split'],
+    elementwise_ops.Sum: ['ReduceSum'],
+    elementwise_ops.MatMul: ['MatMul'],
+    elementwise_ops.Mean: ['ReduceMean'],
+    elementwise_ops.Sqrt: ['Sqrt'],
+    elementwise_ops.Neg: ['Neg'],
+    elementwise_ops.Transpose: ['Transpose'],
 }
 
 # Maps pytorch functional op string names to corresponding onnx types.
