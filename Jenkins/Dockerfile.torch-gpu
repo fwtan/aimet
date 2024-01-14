@@ -136,7 +136,7 @@ RUN apt-get update > /dev/null && \
 # Python3 Packages
 RUN python3 -m pip --no-cache-dir install \
         astroid==2.5.3 \
-        attrs==19.1.0 \
+        attrs>=19.1.0 \
         behave==1.2.6 \
         blosc==1.10.1 \
         cffi==1.12.3 \
@@ -159,15 +159,15 @@ RUN python3 -m pip --no-cache-dir install \
         mock \
         nbsphinx==0.8.12 \
         'numpy<1.24,>=1.20.5' \
-        onnx==1.11.0 \
+        onnx==1.14.1 \
         onnxsim \
-        onnxruntime==1.11.0 \
+        onnxruntime==1.15.1 \
         onnxruntime-extensions \
         opencv-python \
         Pillow==9.3.0 \
         pluggy==0.12.0 \
         progressbar2 \
-        protobuf==3.20.1 \
+        protobuf==3.20.2 \
         psutil \
         ptflops \
         pybind11 \
@@ -189,7 +189,7 @@ RUN python3 -m pip --no-cache-dir install \
         tensorboardX==2.4 \
         timm==0.4.12 \
         torch==1.13.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html \
-        torchaudio==0.13.1 -f https://download.pytorch.org/whl/torch_stable.html \
+        torchaudio==0.13.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html \
         torchtext==0.14.1 \
         torchvision==0.14.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html \
         tqdm \
@@ -272,3 +272,10 @@ RUN ln -s /usr/bin/run-clang-tidy-11.py /usr/bin/run-clang-tidy.py
 
 # Provide write permission to the python package folder in order to install AIMET in editable mode
 RUN chmod o+w /usr/local/lib/python3.8/dist-packages
+
+# Install cutlass 3.3.0
+RUN cd /usr/local && \
+    git clone --depth 1 --branch v3.3.0 https://github.com/NVIDIA/cutlass.git && \
+    mv cutlass cutlass-3.3.0 && \
+    chown -R root:users cutlass-3.3.0 && \
+    ln -s cutlass-3.3.0 cutlass

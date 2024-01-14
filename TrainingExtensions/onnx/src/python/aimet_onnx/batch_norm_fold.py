@@ -1,4 +1,3 @@
-# /usr/bin/env python3.8
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -39,8 +38,11 @@
 
 from typing import Dict, List, Tuple
 import contextlib
-from onnx import onnx_pb, numpy_helper
 import numpy as np
+import onnx
+from onnx import numpy_helper
+from onnxruntime.quantization.onnx_quantizer import ONNXModel
+from packaging import version
 
 from aimet_common.bias_correction import ConvBnPatternHandler
 from aimet_common.graph_pattern_matcher import PatternType
@@ -53,6 +55,12 @@ from aimet_onnx.meta.connectedgraph import ConnectedGraph
 from aimet_onnx.meta.connectedgraph import WEIGHT_INDEX, BIAS_INDEX, RUNNING_MEAN_INDEX, RUNNING_VAR_INDEX
 from aimet_onnx.meta.operations import Op
 from aimet_onnx.utils import get_node_attribute, remove_node, transpose_tensor, ParamUtils, retrieve_constant_input
+
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import NodeProto, TensorProto, ModelProto
+else:
+    from onnx.onnx_pb import NodeProto, TensorProto, ModelProto
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.BatchNormFolding)
 
@@ -104,8 +112,8 @@ def _find_conv_bn_pairs(connected_graph: ConnectedGraph) -> Dict:
 
 
 def find_all_batch_norms_to_fold(connected_graph: ConnectedGraph,
-                                 ) -> Tuple[List[Tuple[onnx_pb.NodeProto, onnx_pb.NodeProto]],
-                                            List[Tuple[onnx_pb.NodeProto, onnx_pb.NodeProto]]]:
+                                 ) -> Tuple[List[Tuple[NodeProto, NodeProto]],
+                                            List[Tuple[NodeProto, NodeProto]]]:
     """
     Find all possible batch norm layers that can be folded. Returns a list of pairs such that (bn, layer)
     means bn will be forward-folded into layer and (layer, bn) means bn will be backward-folded into layer
@@ -165,7 +173,7 @@ def get_ordered_conv_linears(conn_graph: ConnectedGraph) -> List[Op]:
     return ordered_convs
 
 
-def is_valid_bn_fold(conv_linear: onnx_pb.NodeProto, model: onnx_pb.ModelProto, fold_backward: bool) -> bool:
+def is_valid_bn_fold(conv_linear: NodeProto, model: ModelProto, fold_backward: bool) -> bool:
     """
     Determine if a given layer can successfully absorb a BatchNorm given the layer type and parameters
     :param conv_linear: The Conv/Linear layer to fold a BatchNorm into.
@@ -194,13 +202,15 @@ def is_valid_bn_fold(conv_linear: onnx_pb.NodeProto, model: onnx_pb.ModelProto, 
     return valid
 
 
-def fold_all_batch_norms_to_weight(model: onnx_pb.ModelProto) -> [List]:
+def fold_all_batch_norms_to_weight(model: ModelProto) -> [List]:
     """
     Fold all possible batch_norm layers in a model into the weight of the corresponding conv layers
 
     :param model: onnx Model to perform BN fold on
     :return: A list of pairs of layers [(Conv/Linear, BN layer that got folded)]
     """
+    if isinstance(model, ONNXModel):
+        model = model.model
     connected_graph = ConnectedGraph(model)
     model = connected_graph.model
     conv_bn_pairs, bn_conv_pairs = find_all_batch_norms_to_fold(connected_graph)
@@ -219,9 +229,9 @@ def fold_all_batch_norms_to_weight(model: onnx_pb.ModelProto) -> [List]:
     return conv_bns, bn_convs
 
 
-def _fold_to_weight(model: onnx_pb.ModelProto,
-                    conv_linear: onnx_pb.NodeProto,
-                    bn: onnx_pb.NodeProto,
+def _fold_to_weight(model: ModelProto,
+                    conv_linear: NodeProto,
+                    bn: NodeProto,
                     fold_backward: bool):
     """
     Fold BatchNorm into the weight and bias of the given layer.
@@ -274,7 +284,7 @@ def _fold_to_weight(model: onnx_pb.ModelProto,
     return bn_layer
 
 
-def _matmul_to_gemm(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto):
+def _matmul_to_gemm(node: NodeProto, model: ModelProto):
     """
     Convert MatMul node to Gemm and initialize bias to zeros
 
@@ -299,8 +309,8 @@ def _matmul_to_gemm(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto):
     node.input.append(bias_name)
 
 
-def _call_mo_batch_norm_fold(weight: onnx_pb.TensorProto,
-                             bias: onnx_pb.TensorProto,
+def _call_mo_batch_norm_fold(weight: TensorProto,
+                             bias: TensorProto,
                              bn_params: libpymo.BNParams,
                              fold_backward: bool):
     """
@@ -329,7 +339,7 @@ def _call_mo_batch_norm_fold(weight: onnx_pb.TensorProto,
     weight.raw_data = np.asarray(weight_tensor.data, dtype=np.float32).tobytes()
 
 
-def get_bn_params(model: onnx_pb.ModelProto, bn: onnx_pb.NodeProto, channels: int) -> libpymo.BNParams:
+def get_bn_params(model: ModelProto, bn: NodeProto, channels: int) -> libpymo.BNParams:
     """
     Returns the populated libpymo.BNParams object for the given BatchNormalization layer with
     parameters repeated if necessary.
@@ -356,7 +366,7 @@ def get_bn_params(model: onnx_pb.ModelProto, bn: onnx_pb.NodeProto, channels: in
     return bn_params
 
 
-def copy_bn_params_to_bn_layer(bn: onnx_pb.NodeProto, bn_params: libpymo.BNParams) -> BNLayer:
+def copy_bn_params_to_bn_layer(bn: NodeProto, bn_params: libpymo.BNParams) -> BNLayer:
     """
     Copies bn params to a BN layer which can be used later by High bias absorption
     :param bn: BN layer
@@ -391,7 +401,7 @@ def _expand_shape_to_4d(weight_tensor: libpymo.TensorParams):
             weight_tensor.shape = orig_shape
 
 
-def get_input_output_channels(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto) -> Tuple[int, int]:
+def get_input_output_channels(node: NodeProto, model: ModelProto) -> Tuple[int, int]:
     """
     Find the input and output channels of a given layer.
     :param node: The node to find the input/output channels of
@@ -400,6 +410,9 @@ def get_input_output_channels(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto
     """
     weight = ParamUtils.get_param(model, node, WEIGHT_INDEX)
     groups = get_node_attribute(node, "group")
+    # If group atttribute does not exist in the node,then default is 1
+    if not groups:
+        groups = 1
     if node.op_type == "Conv":
         num_in_channels = weight.dims[1] * groups
         num_out_channels = weight.dims[0]

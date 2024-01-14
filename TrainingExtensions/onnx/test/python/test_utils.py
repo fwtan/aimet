@@ -1,4 +1,3 @@
-# /usr/bin/env python3.8
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -36,9 +35,12 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 import onnx
+import torch
+from packaging import version
 
 import aimet_onnx.utils as utils
 from aimet_onnx.utils import ParamUtils
+from aimet_onnx.adaround.utils import ModelData, read_attributes_for_op
 
 from models import models_for_tests
 
@@ -160,22 +162,26 @@ class TestUtils:
         assert utils.get_node_attribute(conv_layer, "kernel_shape") == [3, 3]
 
     def test_replace_relu6_with_relu(self):
-        model = models_for_tests.depthwise_conv_model_with_relu6()
-        relu6_count = 0
-        original_relu_count = 0
-        for node in model.model.graph.node:
-            if node.op_type == 'Clip':
-                relu6_count += 1
-            if node.op_type == 'Relu':
-                original_relu_count += 1
+        if version.parse(torch.__version__) >= version.parse("1.13"):
+            model = models_for_tests.depthwise_conv_model_with_relu6()
+            relu6_count = 0
+            original_relu_count = 0
+            for node in model.model.graph.node:
+                if node.op_type == 'Clip':
+                    relu6_count += 1
+                if node.op_type == 'Relu':
+                    original_relu_count += 1
 
-        utils.replace_relu6_with_relu(model)
+            utils.replace_relu6_with_relu(model)
 
-        relu_count = 0
-        for node in model.model.graph.node:
-            if node.op_type == 'Relu':
-                relu_count += 1
+            relu_count = 0
+            for node in model.model.graph.node:
+                if node.op_type == 'Relu':
+                    relu_count += 1
 
-        hard_swish_count = 1
+            assert relu_count - original_relu_count == relu6_count
 
-        assert relu_count - original_relu_count == relu6_count - hard_swish_count
+    def test_create_model_data_single_residual_model(self):
+        model = models_for_tests.transposed_conv_model_without_bn()
+        model_data = ModelData(model.model)
+        assert len(model_data.module_to_info) == 3

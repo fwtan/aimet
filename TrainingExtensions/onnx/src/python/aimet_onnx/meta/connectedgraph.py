@@ -1,4 +1,3 @@
-#!/usr/bin/env python3.6
 
 #  =============================================================================
 #
@@ -45,10 +44,10 @@ operations represent a module or a function that generates a tensor, while produ
 the tensors that are either input to the model (input, constant or parameter) or the
 result of an operation. Furthermore the graph representation is bi-directional."""
 
-
-from typing import List, Union
-from onnx import onnx_pb
+from typing import List, Union, Dict
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
+import onnx
+from packaging import version
 
 from aimet_common.connected_graph.connectedgraph import ConnectedGraph as AimetCommonConnectedGraph, get_ordered_ops
 from aimet_common.utils import AimetLogger
@@ -57,12 +56,20 @@ from aimet_onnx.meta.operations import Op
 from aimet_onnx.meta.product import Product
 from aimet_onnx.utils import ParamUtils, retrieve_constant_input
 
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import ModelProto, NodeProto, TensorProto
+else:
+    from onnx.onnx_pb import ModelProto, NodeProto, TensorProto
+
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.ConnectedGraph)
 
 WEIGHT_INDEX = 1
 BIAS_INDEX = 2
 RUNNING_MEAN_INDEX = 3
 RUNNING_VAR_INDEX = 4
+OPS_WITH_PARAMS = ["Conv", "Gemm", "ConvTranspose", "BatchNormalization", "MatMul"]
+CONSTANT_TYPE = ['Constant', 'ConstantOfShape']
 
 
 class ConnectedGraph(AimetCommonConnectedGraph):
@@ -71,7 +78,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
     either module or functional) as producers and consumers of tensors.
     Note that the graph has two kinds of nodes: operations and products."""
 
-    def __init__(self, model: onnx_pb.ModelProto):
+    def __init__(self, model: ModelProto):
         """
         :param: model: ONNX model to create connected graph from
         """
@@ -83,13 +90,29 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         # Maps output to consumer node
         self._input_to_node = {}
         self._get_input_to_node()
+        self._unnamed_op = 0
 
         self.starting_ops = []
         self._branch_count = 0
 
+        # Counts number of constant inputs there are in the graph
+        self._constant_count = 0
+        self._constant_nodes_to_output = self._create_set_of_constant_nodes()
+
         self.fill_op_product_graph()
         # List of ops in the order they are traversed using the forward function
         self.ordered_ops = get_ordered_ops(self.starting_ops)
+
+    def _create_set_of_constant_nodes(self) -> Dict:
+        constant_nodes = {}
+        for node in self.model.graph.node:
+            if node.op_type in CONSTANT_TYPE:
+                for output in node.output:
+                    if node.name in constant_nodes:
+                        constant_nodes[node.name].append(output)
+                    else:
+                        constant_nodes[node.name] = [output]
+        return constant_nodes
 
     def get_op_from_module_name(self, name: str) -> Op:
         """
@@ -109,18 +132,59 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                 else:
                     self._input_to_node[input_name] = [node]
 
-    def _get_input_tensors_names(self) -> List:
+    # pylint: disable=too-many-branches
+    def _get_input_ops(self) -> List:
         """ Gets list of names of starting nodes"""
+
+        def check_if_node_has_predecessor(node):
+            for input_name in node.input:
+                if input_name in output_names:
+                    return True
+            return False
+
+        output_names = {}
         input_tensors_names = []
+        for node in self.model.graph.node:
+            for node_output in node.output:
+                output_names[node_output] = node
+
+        # Capture constant tensors associated to a node that has only contant tensor inputs and are not in the form of a constant node.
+        for node in self.model.graph.node:
+            if node.op_type != 'Identity' and node.op_type not in OPS_WITH_PARAMS and not check_if_node_has_predecessor(node):
+                for input_name in node.input:
+                    if input_name not in output_names:
+                        input_tensors_names.append(input_name)
+
+        # Capture model input tensors.
         for tensor in self.model.graph.input:
-            input_tensors_names.append(tensor.name)
+            if tensor.name not in input_tensors_names and tensor.name in self._input_to_node:
+                input_tensors_names.append(tensor.name)
 
-        assert input_tensors_names, "The model does not have any input tensors"
+        # Capture nodes having all the inputs as constant tensors and these constants are coming from a constant node.
+        input_ops = []
+        for node in self.model.graph.node:
+            flag = True
+            if node.op_type == 'Constant':
+                continue
+            for input_name in node.input:
+                if input_name in output_names and output_names[input_name].op_type == 'Constant':
+                    continue
+                else:
+                    flag = False
+                    break
+            if flag and node not in input_ops:
+                input_ops.append(node)
 
-        return input_tensors_names
+        for input_tensor_name in input_tensors_names:
+            if input_tensor_name in self._input_to_node:
+                for node in self._input_to_node[input_tensor_name]:
+                    if node not in input_ops:
+                        input_ops.append(node)
+
+        return input_ops
 
     @staticmethod
-    def _create_ir_op(node: onnx_pb.NodeProto) -> Op:
+    def _create_ir_op(node: NodeProto) -> Op:
         """
         Creates connected graphs internal representation Op
         :param node: ONNX proto node for which Op needs to be created
@@ -140,7 +204,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
 
         return op
 
-    def _add_children_ops_to_op_queue(self, node: onnx_pb.NodeProto, op_queue: List):
+    def _add_children_ops_to_op_queue(self, node: NodeProto, op_queue: List):
         """
         Utility function for adding all children of op to self._op_queue
         :param node: node whose children will be added to op_queue
@@ -156,15 +220,53 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         Processes input ops
         :param op_queue: Queue for performing dfs
         """
-        input_tensors_names = self._get_input_tensors_names()
-        for input_tensor_name in input_tensors_names:
-            if input_tensor_name in self._input_to_node:
-                for node in self._input_to_node[input_tensor_name]:
-                    op = self._create_ir_op(node)
-                    self._ops[node.name] = op
-                    self._create_and_link_product_for_inputs(node.name, input_tensor_name)
-                    self._add_children_ops_to_op_queue(node, op_queue)
-                    self.starting_ops.append(op)
+        input_ops = self._get_input_ops()
+        for node in input_ops:
+            if not node.name:
+                node.name = str(node.op_type) + '_unnamed_' + str(self._unnamed_op)
+                self._unnamed_op += 1
+            node_name = node.name
+            if node_name not in self._ops:
+                op = self._create_ir_op(node)
+                self._ops[node_name] = op
+                self._add_children_ops_to_op_queue(node, op_queue)
+                self.starting_ops.append(op)
+            for index, input_tensor_name in enumerate(node.input):
+                if self.check_if_param(node, index):
+                    continue
+                if self.check_if_const(input_tensor_name):
+                    op = self._ops[node.name]
+                    self._create_constant_product(op, input_tensor_name)
+                else:
+                    self._create_and_link_product_for_inputs(node_name, input_tensor_name)
+
+    @staticmethod
+    def check_if_param(node: NodeProto, index: int) -> bool:
+        """
+        Checks if given tensor is a param
+
+        :param node: ONNX node
+        :param index: input index we are looking at
+        """
+        if node.op_type in ['Gemm', 'Conv', 'ConvTranspose'] and index in [WEIGHT_INDEX, BIAS_INDEX]:
+            return True
+        if node.op_type == 'MatMul' and index == WEIGHT_INDEX:
+            return True
+        if node.op_type == 'BatchNormalization' and index in [WEIGHT_INDEX, BIAS_INDEX, RUNNING_VAR_INDEX, RUNNING_MEAN_INDEX]:
+            return True
+
+        return False
+
+    def check_if_const(self, input_tensor_name: str) -> bool:
+        """
+        Checks if given tensor is a constant
+
+        :param input_tensor_name: input tensor name we are looking at
+        """
+        for output_names in self._constant_nodes_to_output.values():
+            if input_tensor_name in output_names:
+                return True
+        return False
 
     def _create_and_link_product_for_inputs(self, consumer_node_name: str, input_tensor_name: str):
         """
@@ -191,7 +293,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             consumer_op.add_input(product)
             product.add_consumer(consumer_op)
 
-    def _create_op_if_not_exists(self, node: onnx_pb.NodeProto):
+    def _create_op_if_not_exists(self, node: NodeProto):
         """ Creates a CG op for a node"""
         if node.name not in self._ops:
             op = self._create_ir_op(node)
@@ -200,7 +302,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         else:
             logger.debug("Op %s already exists", node.name)
 
-    def _create_and_link_product_if_not_exists(self, child_node: onnx_pb.NodeProto, parent_node: onnx_pb.NodeProto,
+    def _create_and_link_product_if_not_exists(self, child_node: NodeProto, parent_node: NodeProto,
                                                connecting_tensor_name: str):
         """ Create and link new product if it does not yet exist """
         parent_module_name = parent_node.name
@@ -271,6 +373,9 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         # - Index 1 contains the parent node.
         while op_queue:
             child_node, parent_node, connecting_tensor_name = op_queue.pop()
+            if not child_node.name:
+                child_node.name = str(child_node.op_type) + '_unnamed_' + str(self._unnamed_op)
+                self._unnamed_op += 1
             # new module, create op/product and link to parent
             if child_node.name != parent_node.name:
                 self._create_op_if_not_exists(child_node)
@@ -291,6 +396,45 @@ class ConnectedGraph(AimetCommonConnectedGraph):
 
         # Identify places where branch Ops need to be inserted
         self._branch_ops_processing()
+
+        # Create constant products
+        self._create_constant_products_for_model()
+
+    def _create_constant_products_for_model(self):
+        """ Create constant products for all ops in the model """
+        for node in self.model.graph.node:
+            if node.op_type == 'Constant':
+                for output in node.output:
+                    if output in self._input_to_node:
+                        for op in self._input_to_node[output]:
+                            op_name = op.name
+                            cg_op = self._ops[op_name]
+                            self._create_constant_product(cg_op, output)
+
+    def _create_constant_product(self, consumer, connecting_tensor_name):
+        """
+        Create constant product
+
+        :param consumer: Consumer of the product
+        :param connecting_tensor_name: tensor that connects consumer and constant op
+        """
+        product_name = f'constant_{connecting_tensor_name}' + '_to_' + consumer.name
+        if product_name not in self._products:
+            product = Product(product_name, None)
+            # add product to self._products dictionary
+            self._products[product_name] = product
+            logger.debug("Created new product %s", product_name)
+
+            product.tensor_dict[consumer] = product_name
+
+            product.is_const = True
+
+            self._constant_count += 1
+
+            # Link parent op, product, and current op
+            # Fill in input, output, producer, consumer params as appropriate.
+            consumer.add_input(product)
+            product.add_consumer(consumer)
 
     def _branch_ops_processing(self):
         """ Identify places in the op/product graph where branch ops need to be inserted, and create them """
@@ -356,18 +500,25 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         # 4: Remove product from original op to child in child's inputs
         # 5: Remove product from self._products
         for product in product_list:
-            assert len(product.consumers) == 1
-            # item 1
-            branch_op_product.add_consumer(product.consumers[0])
-            # item 2
-            assert len(product.tensor_dict.keys()) == 1
-            branch_op_product.tensor_dict[product.consumers[0]] = product.tensor_dict[product.consumers[0]]
-            # items 3 and 4
-            # replace the old product with the new branch product, in the same index as the old product
-            index = product.consumers[0].inputs.index(product)
-            product.consumers[0].inputs[index] = branch_op_product
-            # item 5
-            del self._products[product.name]
+            assert len(product.consumers) <= 1
+
+            if len(product.consumers) == 1:
+                # item 1
+                branch_op_product.add_consumer(product.consumers[0])
+                # item 2
+                assert len(product.tensor_dict.keys()) == 1
+                branch_op_product.tensor_dict[product.consumers[0]] = product.tensor_dict[product.consumers[0]]
+                # items 3 and 4
+                # replace the old product with the new branch product, in the same index as the old product
+                index = product.consumers[0].inputs.index(product)
+                product.consumers[0].inputs[index] = branch_op_product
+                # item 5
+                del self._products[product.name]
+            else:
+                for output in self.model.graph.output:
+                    if output.name in product.name:
+                        del self._products[product.name]
+                        self._create_link_for_output_product(output.name, branch_op.name)
 
         self._products[branch_op_product.name] = branch_op_product
 
@@ -375,13 +526,14 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         """ Create products for parameters of select modules """
 
         def create_and_connect_product(param_name: str, product_shape: List, my_op: Op,
-                                       param_tensor: onnx_pb.TensorProto, product_type: Union[str, None]):
+                                       param_tensor: TensorProto, product_type: Union[str, None]):
             """ Create product with given name, shape, and corresponding tensor.  Connect product to my_op. """
 
             product = Product(param_name, product_shape)
             product.is_parm = True
             product.add_consumer(my_op)
             product.tensor_dict[my_op] = param_tensor
+            product.tensor = param_tensor
             my_op.add_input(product)
             self._products[product.name] = product
             my_op.add_param(param_name, product, product_type)
@@ -413,18 +565,22 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             op = my_op.get_module()
 
             gamma_tensor = ParamUtils.get_param(self.model, op, WEIGHT_INDEX)
-            create_and_connect_product(gamma_tensor.name, gamma_tensor.dims, my_op, gamma_tensor, 'weight')
+            if gamma_tensor:
+                create_and_connect_product(gamma_tensor.name, gamma_tensor.dims, my_op, gamma_tensor, 'weight')
 
             beta_tensor = ParamUtils.get_param(self.model, op, BIAS_INDEX)
-            create_and_connect_product(beta_tensor.name, beta_tensor.dims, my_op, beta_tensor, 'bias')
+            if beta_tensor:
+                create_and_connect_product(beta_tensor.name, beta_tensor.dims, my_op, beta_tensor, 'bias')
 
             moving_mean_tensor = ParamUtils.get_param(self.model, op, RUNNING_MEAN_INDEX)
-            create_and_connect_product(moving_mean_tensor.name, moving_mean_tensor.dims, my_op,
-                                       moving_mean_tensor, None)
+            if moving_mean_tensor:
+                create_and_connect_product(moving_mean_tensor.name, moving_mean_tensor.dims, my_op,
+                                           moving_mean_tensor, None)
 
             moving_variance_tensor = ParamUtils.get_param(self.model, op, RUNNING_VAR_INDEX)
-            create_and_connect_product(moving_variance_tensor.name, moving_variance_tensor.dims, my_op,
-                                       moving_variance_tensor, None)
+            if moving_variance_tensor:
+                create_and_connect_product(moving_variance_tensor.name, moving_variance_tensor.dims, my_op,
+                                           moving_variance_tensor, None)
 
         def handle_default(my_op: Op):
             """ Handler for other modules """
@@ -435,6 +591,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             "Gemm": create_conv2d_dense_type_params,
             "ConvTranspose": create_conv2d_dense_type_params,
             "BatchNormalization": create_batchnorm_params,
+            "InstanceNormalization": create_batchnorm_params,
             "MatMul": create_matmul_params
         }
 
@@ -443,7 +600,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             handler(op)
 
 
-def get_op_attributes(node: onnx_pb.NodeProto, attribute_name: str):
+def get_op_attributes(node: NodeProto, attribute_name: str):
     """
     Gets attribute information for layer
 

@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -374,7 +373,7 @@ class QcQuantizeWrapper(nn.Module):
             :param type_of_quantizer: input or output
             :param quantizers: input or output quantizers
             """
-            if type_of_quantizer in activation_encodings[module_name]:
+            if module_name in activation_encodings and type_of_quantizer in activation_encodings[module_name]:
                 encodings = activation_encodings[module_name][type_of_quantizer]
                 # The number of quantizers and encodings might not be same. For example, suppose the 1st output
                 # quantizer is disabled out of 4. The number of encodings will be 3, but number of output quantizers
@@ -390,6 +389,11 @@ class QcQuantizeWrapper(nn.Module):
                     if not quantizer.enabled:
                         raise RuntimeError("The quantsim passed for loading encodings does not have the same "
                                            "configuration as the quantsim which was used to export the encodings")
+
+                    if quantizer._is_encoding_frozen: # pylint: disable=protected-access
+                        _logger.debug("Encodings are frozen for module %s and quantizer type %s", module_name,
+                                      type_of_quantizer)
+                        continue
 
                     if encodings[ind]['dtype'] == 'int':
                         encoding, is_symmetric = utils.create_encoding_from_dict(encodings[ind])
@@ -415,7 +419,8 @@ class QcQuantizeWrapper(nn.Module):
         """
         for orig_param_name, param_quantizer in self.param_quantizers.items():
             param_name = module_name + '.' + orig_param_name
-            if param_name in param_encodings:
+            # pylint: disable=protected-access
+            if param_name in param_encodings and param_quantizer.enabled and not param_quantizer._is_encoding_frozen:
                 encodings = []
                 if param_encodings[param_name][0]['dtype'] == 'int':
                     is_symmetric = False
@@ -445,6 +450,22 @@ class QcQuantizeWrapper(nn.Module):
             if param_name in param_encodings:
                 param_quantizer.freeze_encoding()
                 _logger.info("Freezing quantization encodings for parameter: %s", param_name)
+
+    def freeze_activation_encoding(self, name: str, activation_encoding: Dict):
+        """
+        Freeze encodings for activation
+
+        :param module_name: name of module
+        :param activation_encodings: activation encodings dictionary
+        """
+        for input_quantizer, output_quantizer in zip(self.input_quantizers, self.output_quantizers):
+            if name in activation_encoding:
+                if QUANTIZER_TYPE_INPUT in activation_encoding[name]:
+                    input_quantizer.freeze_encoding()
+                    _logger.info("Freezing quantization encodings for input activation: %s", name)
+                if QUANTIZER_TYPE_OUTPUT in activation_encoding[name]:
+                    output_quantizer.freeze_encoding()
+                    _logger.info("Freezing quantization encodings for output activation: %s", name)
 
     @staticmethod
     def should_perform_quant_dequant(tensor: torch.Tensor, tensor_quantizer: TensorQuantizer) -> bool:
@@ -654,7 +675,7 @@ class StaticGridQuantWrapper(QcQuantizeWrapper):
             if not self.should_perform_quant_dequant(input_tensor, tensor_quantizers[index]):
                 return input_tensor
 
-            if self._mode is QcQuantizeOpMode.ANALYSIS:
+            if self._mode is QcQuantizeOpMode.ANALYSIS and not tensor_quantizers[index].is_encoding_frozen:
                 if TF_ENHANCED_USE_DOWNSAMPLING and \
                         tensor_quantizers[index].quant_scheme == QuantScheme.post_training_tf_enhanced:
                     # Update stats using downsampled output to speed up tf enhanced
@@ -667,7 +688,7 @@ class StaticGridQuantWrapper(QcQuantizeWrapper):
 
                 output = input_tensor
 
-            elif self._mode is QcQuantizeOpMode.ACTIVE:
+            elif self._mode is QcQuantizeOpMode.ACTIVE or (self._mode is QcQuantizeOpMode.ANALYSIS and tensor_quantizers[index].is_encoding_frozen):
                 # if we are not in training, then only nearest rounding should be used
                 # else we should use whatever the user desires (i.e.. stochastic rounding is a valid option)
                 if self.training:

@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -347,6 +346,7 @@ class AdaroundConstants:
 
 class QuantizationDataType(Enum):
     """ Enumeration of tensor quantizer data types supported """
+    undefined = 0
     int = 1
     float = 2
 
@@ -362,7 +362,9 @@ class QuantDtypeBwInfo:
     QuantDtypeBwInfo holds activation dtype/bw and param dtype/bw
     """
 
-    def __init__(self, act_dtype: QuantizationDataType, act_bw: int, param_dtype: QuantizationDataType, param_bw: int):
+
+    def __init__(self, act_dtype: QuantizationDataType, act_bw: int,
+                 param_dtype: QuantizationDataType = QuantizationDataType.undefined, param_bw: int = 0):
         """
         Data class to hold dtype and bw info
         :param act_dtype: Activation datatype of type QuantizationDataType
@@ -376,9 +378,11 @@ class QuantDtypeBwInfo:
         self.param_bw = param_bw
         self._validate_inputs()
 
+    def __repr__(self):
+        return f'(activation:({self.act_dtype}, {self.act_bw}) param:({self.param_dtype}, {self.param_bw})'
+
     def __str__(self):
-        return (f'(activation_data_type = {self.act_dtype}, act_bw = {self.act_bw} '
-                f'param_data_type = {self.param_dtype} param_bw = {self.param_bw})')
+        return f'activation:({self.act_dtype}, {self.act_bw}) param:({self.param_dtype}, {self.param_bw})'
 
     def __eq__(self, other):
         return self.act_dtype == other.act_dtype and self.act_bw == other.act_bw and \
@@ -388,15 +392,16 @@ class QuantDtypeBwInfo:
         """
         Validate inputs
         """
-        if self.param_dtype == QuantizationDataType.float and self.param_bw != 16:
-            raise ValueError(
-                'float param_dtype can only be used when param_bw is set to 16, not ' + str(self.param_bw))
+        if self.param_dtype and self.param_bw:
+            if self.param_dtype == QuantizationDataType.float and self.param_bw not in [16, 32]:
+                raise ValueError(
+                    'float param_dtype can only be used when param_bw is set to 16, not ' + str(self.param_bw))
 
-        if self.act_dtype == QuantizationDataType.float and self.act_bw != 16:
+        if self.act_dtype == QuantizationDataType.float and self.act_bw not in [16, 32]:
             raise ValueError(
                 'float act_dtype can only be used when act_bw is set to 16, not ' + str(self.act_bw))
 
-    def is_same_activation(self, bw: int, dtype: QuantizationDataType):
+    def is_same_activation(self, dtype: QuantizationDataType, bw: int):
         """
         helper function to check if activation of the object is same as input
         :param bw: bitwidth to verify against
@@ -404,10 +409,18 @@ class QuantDtypeBwInfo:
         """
         return bw == self.act_bw and dtype == self.act_dtype
 
-    def is_same_param(self, bw: int, dtype: QuantizationDataType):
+    def is_same_param(self, dtype: QuantizationDataType, bw: int):
         """
         helper function to check if param of the object is same as input
         :param bw: bitwidth to verify against
         :param dtype: dtype to verify against
         """
         return bw == self.param_bw and dtype == self.param_dtype
+
+    def get_activation(self) -> tuple:
+        """ getter method for activation candidate"""
+        return self.act_dtype, self.act_bw
+
+    def get_param(self) -> tuple:
+        """ getter method for param candidate"""
+        return self.param_dtype, self.param_bw

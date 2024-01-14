@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -45,8 +44,10 @@ Layer groups: Groups of layers that are immediately connected and can be decompo
 
 from typing import Tuple, List, Union
 import numpy as np
-from onnx import onnx_pb, numpy_helper
+import onnx
+from onnx import numpy_helper
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
+from packaging import version
 
 from aimet_common.utils import AimetLogger
 from aimet_common.connected_graph.connectedgraph import get_ordered_ops
@@ -58,6 +59,12 @@ from aimet_onnx.meta.connectedgraph import ConnectedGraph, WEIGHT_INDEX, BIAS_IN
 from aimet_onnx.meta.operations import Op
 from aimet_onnx.utils import transpose_tensor, ParamUtils, get_node_attribute, replace_relu6_with_relu
 from aimet_onnx.batch_norm_fold import BNLayer, fold_all_batch_norms_to_weight
+
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import NodeProto, ModelProto
+else:
+    from onnx.onnx_pb import NodeProto, ModelProto
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -83,7 +90,7 @@ class CrossLayerScaling(CLS):
     """
     Scales a model's layers to equalize the weights between consecutive layers
     """
-    def __init__(self, model: onnx_pb.ModelProto):
+    def __init__(self, model: ModelProto):
         """
         :param model: ONNX model
         """
@@ -122,7 +129,7 @@ class CrossLayerScaling(CLS):
 
         return cls_set_info_list
 
-    def _populate_libpymo_params(self, module: onnx_pb.NodeProto,
+    def _populate_libpymo_params(self, module: NodeProto,
                                  layer_param: libpymo.EqualizationParams):
         """
         Populates libpymo weight parameter
@@ -159,7 +166,7 @@ class CrossLayerScaling(CLS):
             prev_layer_params.isBiasNone = True
 
     def _update_weight_for_layer_from_libpymo_obj(self, layer_param: libpymo.EqualizationParams,
-                                                  module: onnx_pb.NodeProto):
+                                                  module: NodeProto):
         """
         Update weight parameter from libpymo object
         """
@@ -258,7 +265,7 @@ class HighBiasFold(HBF):
     """
     Code to apply the high-bias-fold technique to a model
     """
-    def __init__(self, model: onnx_pb.ModelProto):
+    def __init__(self, model: ModelProto):
         self._model = model
 
     def _check_if_bias_is_none(self, layer: Op) -> bool:
@@ -308,7 +315,7 @@ class HighBiasFold(HBF):
         curr_layer_params.weightShape = get_weight_dimensions(np.array(weight.dims))
 
     def _update_bias_for_layer_from_libpymo_obj(self, layer_param: libpymo.LayerParams,
-                                                module: onnx_pb.NodeProto):
+                                                module: NodeProto):
         """
         Update bias parameter from libpymo object
         """
@@ -341,7 +348,7 @@ def get_weight_dimensions(weight_shape: np.array) -> np.array:
     return np.append(weight_shape, [1 for _ in range(4 - dims)]).astype(int)
 
 
-def equalize_model(model: onnx_pb.ModelProto):
+def equalize_model(model: ModelProto):
     """
     High-level API to perform Cross-Layer Equalization (CLE) on the given model. The model is equalized in place.
 
