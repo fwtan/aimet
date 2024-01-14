@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -347,9 +346,10 @@ class NonMaxSuppression(torch.nn.Module):
     """
     Implementation of NMS Op in the form of nn.Module
     """
-    def __init__(self, iou_threshold: float, max_output_boxes_per_class: int):
+    def __init__(self, iou_threshold: float, score_threshold: float, max_output_boxes_per_class: int):
         super().__init__()
         self.iou_threshold = iou_threshold
+        self.score_threshold = score_threshold
         self.max_output_boxes_per_class = max_output_boxes_per_class
 
     def forward(self, *args) -> torch.Tensor:
@@ -362,11 +362,31 @@ class NonMaxSuppression(torch.nn.Module):
         res = []
         for index, (boxes, scores) in enumerate(zip(batches_boxes, batch_scores)):
             for class_index, classes_score in enumerate(scores):
-                res_ = torchvision.ops.nms(boxes, classes_score, self.iou_threshold)
-                for val in res_:
-                    res.append([index, class_index, val.detach()])
-                res = res[:(self.max_output_boxes_per_class *(index+1))]
-        return torch.Tensor(res).type(torch.int64)
+                nms_output = self.perform_nms_per_class(boxes, classes_score)
+                res_per_class = []
+                for val in nms_output:
+                    res_per_class.append([index, class_index, val.detach()])
+                res_per_class = res_per_class[:self.max_output_boxes_per_class]
+                res.extend(res_per_class)
+
+        res = torch.Tensor(res).type(torch.int64)
+        out = torch.zeros(batch_scores.shape[0] * batch_scores.shape[1] * self.max_output_boxes_per_class, 3, dtype=torch.int64)
+        indices = torch.arange(0, len(res) * 3, dtype=torch.int64)
+        out.put_(indices, res)
+        return out
+
+    def perform_nms_per_class(self, boxes: torch.Tensor, classes_score: torch.Tensor) -> torch.Tensor:
+        """
+        Performs NMS per class
+        :param boxes: boxes on which NMS should be performed
+        :param classes_score: corresponding class scores for the boxes
+        :return: returns box indices filtered out by NMS
+        """
+        filtered_score_ind = (classes_score > self.score_threshold).nonzero()[:, 0]
+        filtered_boxes = boxes[filtered_score_ind]
+        filtered_classes_score = classes_score[filtered_score_ind]
+        res_ = torchvision.ops.nms(filtered_boxes, filtered_classes_score, self.iou_threshold)
+        return filtered_score_ind[res_]
 
 
 class GatherNd(torch.nn.Module):

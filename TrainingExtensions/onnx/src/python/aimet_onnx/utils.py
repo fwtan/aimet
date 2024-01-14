@@ -1,4 +1,3 @@
-# /usr/bin/env python3.8
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -43,16 +42,25 @@ import os
 import pickle
 import numpy as np
 import onnx
-from onnx import onnx_pb, helper, numpy_helper, mapping
+from onnx import helper, numpy_helper, mapping
+from packaging import version
+
 from aimet_common.utils import AimetLogger
+
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import NodeProto, TensorProto, ModelProto, GraphProto, ValueInfoProto
+else:
+    from onnx.onnx_pb import NodeProto, TensorProto, ModelProto, GraphProto, ValueInfoProto
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 
 
-OP_TYPES_WITH_PARAMS = ['Conv', 'Gemm', 'ConvTranspose', 'BatchNormalization', 'MatMul', 'Transpose']
+OP_TYPES_WITH_PARAMS = ['Conv', 'Gemm', 'ConvTranspose', 'BatchNormalization', 'MatMul', 'Transpose',
+                        'InstanceNormalization']
 
 
-def remove_nodes_with_type(node_type: str, onnx_graph: onnx.onnx_pb.GraphProto):
+def remove_nodes_with_type(node_type: str, onnx_graph: onnx.GraphProto):
     """
     Remove specific type of nodes from graph
 
@@ -74,7 +82,7 @@ def remove_nodes_with_type(node_type: str, onnx_graph: onnx.onnx_pb.GraphProto):
                 node.output[0] = outputs.name
 
 
-def remove_node(node: onnx_pb.ModelProto, onnx_graph: onnx.onnx_pb.GraphProto):
+def remove_node(node: ModelProto, onnx_graph: onnx.GraphProto):
     """
     Remove a specific node from graph along with associated initializers
 
@@ -91,7 +99,7 @@ def remove_node(node: onnx_pb.ModelProto, onnx_graph: onnx.onnx_pb.GraphProto):
                     other_node.input[idx] = node.input[0]
             # Check if removed node output is an output of the graph
             for outputs in onnx_graph.output:
-                if outputs.name in node.output[0] and other_node.output[0] == node.input[0]:
+                if outputs.name == node.output[0] and other_node.output[0] == node.input[0]:
                     other_node.output[0] = outputs.name
     inits_to_remove = []
     # Remove the node's initializers
@@ -102,7 +110,7 @@ def remove_node(node: onnx_pb.ModelProto, onnx_graph: onnx.onnx_pb.GraphProto):
         onnx_graph.initializer.remove(item)
 
 
-def transpose_tensor(t: onnx.onnx_ml_pb2.TensorProto, axes: Union[List, Tuple]) -> onnx.onnx_ml_pb2.TensorProto:
+def transpose_tensor(t: TensorProto, axes: Union[List, Tuple]) -> TensorProto:
     """
     Permutes the axes of a given array using numpy.transpose
 
@@ -117,7 +125,7 @@ def transpose_tensor(t: onnx.onnx_ml_pb2.TensorProto, axes: Union[List, Tuple]) 
     return numpy_helper.from_array(np.transpose(t_np, axes), name=t.name)
 
 
-def replace_node_with_op(node_type: str, new_type: str, onnx_graph: onnx.onnx_pb.GraphProto):
+def replace_node_with_op(node_type: str, new_type: str, onnx_graph: onnx.GraphProto):
     """
     Replace the given op type of nodes to new op type
 
@@ -131,7 +139,7 @@ def replace_node_with_op(node_type: str, new_type: str, onnx_graph: onnx.onnx_pb
             node.op_type = new_type
 
 
-def get_node_attribute(node: onnx_pb.NodeProto, name: str):
+def get_node_attribute(node: NodeProto, name: str):
     """
     Return the value of a node's attribute specified by its name
 
@@ -145,7 +153,7 @@ def get_node_attribute(node: onnx_pb.NodeProto, name: str):
     return None
 
 
-def get_weights(name: str, onnx_graph: onnx.onnx_pb.GraphProto) -> bytes:
+def get_weights(name: str, onnx_graph: onnx.GraphProto) -> bytes:
     """
     Return the weights by given name
     :param name, name of the weights to find
@@ -159,7 +167,7 @@ def get_weights(name: str, onnx_graph: onnx.onnx_pb.GraphProto) -> bytes:
     return None
 
 
-def get_ordered_dict_of_nodes(onnx_graph: onnx.onnx_pb.GraphProto) -> Dict:
+def get_ordered_dict_of_nodes(onnx_graph: onnx.GraphProto) -> Dict:
     """
     Return the ordered list of nodes
 
@@ -173,7 +181,7 @@ def get_ordered_dict_of_nodes(onnx_graph: onnx.onnx_pb.GraphProto) -> Dict:
     return ordered_dict
 
 
-def make_dummy_input(model: onnx_pb.ModelProto, dynamic_size: int = 1) -> Dict[str, np.ndarray]:
+def make_dummy_input(model: ModelProto, dynamic_size: int = 1) -> Dict[str, np.ndarray]:
     """
     Create a dummy input based on the model input types and shapes
 
@@ -193,11 +201,12 @@ def make_dummy_input(model: onnx_pb.ModelProto, dynamic_size: int = 1) -> Dict[s
             else:
                 # Else, axis has a fixed dimension size stored in dim.dim_value
                 shape.append(dim.dim_value)
-        input_dict[name] = np.random.randn(*shape).astype(mapping.TENSOR_TYPE_TO_NP_TYPE[dtype])
+        if shape:
+            input_dict[name] = np.random.randn(*shape).astype(mapping.TENSOR_TYPE_TO_NP_TYPE[dtype])
     return input_dict
 
 
-def replace_relu6_with_relu(model: onnx_pb.ModelProto):
+def replace_relu6_with_relu(model: ModelProto):
     """
     Replace relu6 op with relu op
 
@@ -227,9 +236,10 @@ def replace_relu6_with_relu(model: onnx_pb.ModelProto):
                 )
 
                 model.add_node(relu_node)
+    model.topological_sort()
 
 
-def check_if_clip_node_minimum_is_zero(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto):
+def check_if_clip_node_minimum_is_zero(node: NodeProto, model: ModelProto):
     """
     Check if the clip node's minimum is 0
 
@@ -248,7 +258,7 @@ def check_if_clip_node_minimum_is_zero(node: onnx_pb.NodeProto, model: onnx_pb.M
     return False
 
 
-def add_hook_to_get_activation(model: onnx_pb.ModelProto, name: str) -> onnx_pb.ValueInfoProto:
+def add_hook_to_get_activation(model: ModelProto, name: str) -> ValueInfoProto:
     """
     Adds a given activation to the model output
     :param model: The model to add the hook to
@@ -261,8 +271,8 @@ def add_hook_to_get_activation(model: onnx_pb.ModelProto, name: str) -> onnx_pb.
     return val_info
 
 
-def remove_activation_hooks(model: onnx_pb.ModelProto,
-                            hooks: Union[List[onnx_pb.ValueInfoProto], onnx_pb.ValueInfoProto]):
+def remove_activation_hooks(model: ModelProto,
+                            hooks: Union[List[ValueInfoProto], ValueInfoProto]):
     """
     Removes activation hooks from the model output
     :param model: The model from which to remove the hooks
@@ -274,7 +284,7 @@ def remove_activation_hooks(model: onnx_pb.ModelProto,
         model.graph.output.remove(hook)
 
 
-def get_graph_intermediate_activations(graph: onnx_pb.GraphProto) -> List[str]:
+def get_graph_intermediate_activations(graph: GraphProto) -> List[str]:
     """
     Returns the names of all activations within a graph that are used as the input to another node
     :param graph: The graph for which to retrieve the activations
@@ -295,7 +305,7 @@ def get_graph_intermediate_activations(graph: onnx_pb.GraphProto) -> List[str]:
 class ParamUtils:
     """ Param utilities """
     @staticmethod
-    def get_shape(model: onnx_pb.ModelProto, node: onnx_pb.NodeProto, param_index: int) -> List:
+    def get_shape(model: ModelProto, node: NodeProto, param_index: int) -> List:
         """
         Returns a list of shape for the param specifies
         :param model: ONNX model
@@ -314,7 +324,7 @@ class ParamUtils:
         return None
 
     @staticmethod
-    def get_param(model: onnx_pb.ModelProto, node: onnx_pb.NodeProto, param_index: int) -> onnx_pb.TensorProto:
+    def get_param(model: ModelProto, node: NodeProto, param_index: int) -> TensorProto:
         """
         Returns the param tensor
         :param model: ONNX model
@@ -343,8 +353,8 @@ def get_product_name_from_quantized_name(quantized_name: str):
     return None
 
 
-def retrieve_constant_input(node: onnx_pb.NodeProto, model: onnx_pb.ModelProto, index: int
-                            ) -> Tuple[onnx_pb.TensorProto, bool]:
+def retrieve_constant_input(node: NodeProto, model: ModelProto, index: int
+                            ) -> Tuple[TensorProto, bool]:
     """
     Retrieves node input at the specified index if the input has a corresponding initializer in model.graph.initializer
     and is separated from node by no more than one Transpose operation.
@@ -414,7 +424,7 @@ class CachedDataset:
         logger.info('Caching %d batches from data loader at path location: %s', self._num_batches, self._path)
 
 
-def create_input_dict(model: onnx_pb.ModelProto, input_batch: Union[np.ndarray, List[np.ndarray], Tuple[np.ndarray]]) -> Dict:
+def create_input_dict(model: ModelProto, input_batch: Union[np.ndarray, List[np.ndarray], Tuple[np.ndarray]]) -> Dict:
     """
     Creates input dictionary (input name to input value map) for session.run
 

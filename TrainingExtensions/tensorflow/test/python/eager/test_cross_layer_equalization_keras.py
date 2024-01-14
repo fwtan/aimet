@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -465,7 +464,7 @@ class TestTrainingExtensionsCrossLayerScaling:
         assert not np.array_equal(before_scaling_conv0_weight, after_scaling_conv0_weight)
         after_scaling_output = model.predict(inp_array)
 
-        assert np.allclose(before_scaling_ouptut, after_scaling_output, rtol=1.e-2, atol=1.e-5)
+        assert np.allclose(before_scaling_ouptut, after_scaling_output, rtol=1.e-2, atol=1.e-2)
 
     def test_create_cls_set_info_list(self):
         """

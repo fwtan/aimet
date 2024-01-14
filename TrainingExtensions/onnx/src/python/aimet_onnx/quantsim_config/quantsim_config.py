@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -39,7 +38,9 @@
 from abc import abstractmethod
 from typing import List, Dict, Tuple
 
-from onnx import onnx_pb
+import onnx
+from packaging import version
+
 from aimet_common.defs import QuantizationDataType
 from aimet_common.graph_searcher import GraphSearcher
 from aimet_common.connected_graph.connectedgraph_utils import get_all_input_ops, get_all_output_ops
@@ -48,9 +49,15 @@ from aimet_common.quantsim_config.json_config_importer import ConfigDictKeys, Co
 from aimet_common.quantsim_config.quantsim_config import QuantSimConfigurator as AimetCommonQuantSimConfigurator, \
     get_setting_type, SupergroupConfigCallback as AimetCommonSupergroupConfigCallback, reformat_supported_kernels
 from aimet_common.utils import AimetLogger
-from aimet_onnx.meta.connectedgraph import ConnectedGraph
+from aimet_onnx.meta.connectedgraph import ConnectedGraph, CONSTANT_TYPE
 from aimet_onnx.utils import get_product_name_from_quantized_name
 from aimet_onnx.qc_quantize_op import OpMode, QcQuantizeOp
+
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import ModelProto, NodeProto
+else:
+    from onnx.onnx_pb import ModelProto, NodeProto
 
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
@@ -69,7 +76,7 @@ class OpToQuantizers:
 class SupergroupConfigCallback(AimetCommonSupergroupConfigCallback):
     """ Class acting as a callback for when supergroups are found """
 
-    def __init__(self, model: onnx_pb.ModelProto, op_to_quantizers: Dict):
+    def __init__(self, model: ModelProto, op_to_quantizers: Dict):
         super().__init__()
         self._model = model
         self._op_to_quantizers = op_to_quantizers
@@ -87,7 +94,7 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
     """ Class for parsing and applying
     quantsim configurations from json config file """
 
-    def __init__(self, model: onnx_pb.ModelProto, conn_graph: ConnectedGraph, config_file: str, quantsim_output_bw: int,
+    def __init__(self, model: ModelProto, conn_graph: ConnectedGraph, config_file: str, quantsim_output_bw: int,
                  quantsim_param_bw: int, quantsim_data_type: QuantizationDataType = QuantizationDataType.int):
         super().__init__(config_file, quantsim_data_type, quantsim_output_bw, quantsim_param_bw)
 
@@ -96,6 +103,7 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
         self._quant_ops_dict = {}
         self._param_names = {}
         self._activation_names = {}
+        self._input_quantizers = {}
         self._op_to_quantizer_lists_dict = None
         self._op_to_quantizers = {}
         self._supported_kernels = self._parse_supported_kernels()
@@ -118,13 +126,15 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
 
     def configure_quantizers(self, quant_ops_dict: Dict,
                              param_names: List[str],
-                             activation_names: List[str]):
+                             activation_names: List[str],
+                             input_activations: List[str]):
         """
         Configures quantizers based on config file
         """
         self._quant_ops_dict = quant_ops_dict
         self._param_names = param_names
         self._activation_names = activation_names
+        self._input_quantizers = input_activations
 
         self._op_to_quantizers = self._map_quantizers_to_ops()
 
@@ -276,13 +286,27 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
         Set model input specific configurations (fifth level of specificity in configuration file)
         :param model_input_configs: Configuration for model inputs
         """
+        modified_quantize_ops = {}
         input_ops = get_all_input_ops(self._conn_graph)
-        for input_op in input_ops:
-            op_name = input_op.name
-            if op_name in self._op_to_quantizers:
-                modified_quantize_ops = {}
-                self._set_config_for_op(op_name, self._op_to_quantizers[op_name],
+        for op in input_ops:
+            if op.name in self._op_to_quantizers:
+                self._set_config_for_op(op.name, self._op_to_quantizers[op.name],
                                         model_input_configs, modified_quantize_ops)
+
+        for activation_name in self._input_quantizers:
+            if self._quant_ops_dict[activation_name] not in modified_quantize_ops:
+                self._modify_activation_quantize_op([self._quant_ops_dict[activation_name]], ConfigDictKeys.IS_INPUT_QUANTIZED,
+                                                    model_input_configs[ConfigDictKeys.IS_INPUT_QUANTIZED], modified_quantize_ops)
+
+        for node in self._model.model.graph.node:
+            if node.op_type in CONSTANT_TYPE:
+                for activation_name in node.output:
+                    if activation_name in self._quant_ops_dict and \
+                            self._quant_ops_dict[activation_name] not in modified_quantize_ops:
+                        self._modify_activation_quantize_op([self._quant_ops_dict[activation_name]],
+                                                            ConfigDictKeys.IS_INPUT_QUANTIZED,
+                                                            model_input_configs[ConfigDictKeys.IS_INPUT_QUANTIZED],
+                                                            modified_quantize_ops)
 
     def _set_model_output_configs(self, model_output_configs: ConfigType):
         """
@@ -333,8 +357,20 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
         for op_name, op_to_quantizer in self._op_to_quantizers.items():
             self._set_config_for_op(op_name, op_to_quantizer, default_op_configs, modified_quantize_ops)
 
-        for model_input in self._model.model.graph.input:
-            self._quant_ops_dict[model_input.name].enabled = False
+        input_ops = get_all_input_ops(self._conn_graph)
+        for op in input_ops:
+            if op.name in self._op_to_quantizers:
+                for input_quantizer in self._op_to_quantizers[op.name].input_quantizers:
+                    input_quantizer.enabled = False
+
+        for activation_name in self._input_quantizers:
+            self._quant_ops_dict[activation_name].enabled = False
+
+        for node in self._model.model.graph.node:
+            if node.op_type in CONSTANT_TYPE:
+                for activation_name in node.output:
+                    if activation_name in self._quant_ops_dict:
+                        self._quant_ops_dict[activation_name].enabled = False
 
     def _set_config_for_op(self, op_name, op_to_quantizer: OpToQuantizers, op_config: OpType,
                            modified_quantize_ops: Dict):
@@ -493,10 +529,10 @@ class OpInstanceConfigGenerator:
         assert ConfigDictKeys.DEFAULTS in self.op_type_pcq
 
     @abstractmethod
-    def generate(self, op: onnx_pb.NodeProto, op_type: str) -> dict:
+    def generate(self, op: NodeProto, op_type: str) -> dict:
         """ generate the config for the given op """
 
-    def _generate_pcq(self, op: onnx_pb.NodeProto) -> bool:
+    def _generate_pcq(self, op: NodeProto) -> bool:
         """
         Helper function to generate the pcq field
         :param op: op instance to generate the pcq value for
@@ -521,7 +557,7 @@ class DefaultOpInstanceConfigGenerator(OpInstanceConfigGenerator):
     Default implementation of OpInstanceConfigGenerator
     """
 
-    def generate(self, op: onnx_pb.NodeProto, op_type: str) -> Tuple[dict, bool]:
+    def generate(self, op: NodeProto, op_type: str) -> Tuple[dict, bool]:
         """
         :param op: op to generate the specialized config
         :param op_type: Type str retrieved from CG op

@@ -1,4 +1,3 @@
-# /usr/bin/env python3.6
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -38,12 +37,13 @@
 # pylint: skip-file
 
 """ Top level API for Adaptive Rounding - Post-Training Quantization (PTQ) """
+import copy
 import os
 import shutil
-import contextlib
+import json
 from typing import Tuple, Dict, List, Callable
 from onnx import onnx_pb
-
+from onnxruntime.quantization.onnx_quantizer import ONNXModel
 from tqdm import tqdm
 
 # Import AIMET specific modules
@@ -56,6 +56,9 @@ from aimet_onnx.quantsim import QuantizationSimModel
 from aimet_onnx.qc_quantize_op import OpMode
 from aimet_onnx.meta.utils import get_module_act_func_pair, get_ordered_ops
 from aimet_onnx import utils
+from aimet_onnx.adaround.adaround_optimizer import AdaroundOptimizer
+from aimet_onnx.adaround.utils import ModelData
+
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -71,7 +74,7 @@ class AdaroundParameters:
     def __init__(self, data_loader, num_batches: int,
                  default_num_iterations: int = None, default_reg_param: float = 0.01,
                  default_beta_range: Tuple = (20, 2), default_warm_start: float = 0.2,
-                 forward_fn: Callable = None):
+                 forward_fn: Callable = None, forward_pass_callback_args = None):
         """
         :param data_loader: Data loader
         :param num_batches: Number of batches to be used for Adaround.
@@ -83,9 +86,11 @@ class AdaroundParameters:
         :param default_beta_range: Start and stop beta parameter for annealing of rounding loss (start_beta, end_beta).
          Default (20, 2)
         :param default_warm_start: warm up period, during which rounding loss has zero effect. Default 20% (0.2)
-        :param forward_fn: Optional adapter function that performs forward pass given a model and inputs
-         yielded from the data loader. The function expects model as first argument and inputs to model
-         as second argument.
+        :param forward_fn: Function to compute encodings for sim
+        :param forward_pass_callback_args: These argument(s) are passed to the forward_pass_callback as-is. Up to
+            the user to determine the type of this parameter. E.g. could be simply an integer representing the number
+            of data samples to use. Or could be a tuple of parameters or an object representing something more complex.
+            If set to None, forward_pass_callback will be invoked with no parameters.
         """
         if len(data_loader) < num_batches:
             raise ValueError(f'Can not fetch {num_batches} batches from '
@@ -98,6 +103,7 @@ class AdaroundParameters:
         self.beta_range = default_beta_range
         self.warm_start = default_warm_start
         self.forward_fn = forward_fn
+        self.forward_pass_callback_args = forward_pass_callback_args
 
 
 class Adaround:
@@ -110,7 +116,7 @@ class Adaround:
                        param_bw_override_list: List[Tuple[str, int]] = None,
                        ignore_quant_ops_list: List[str] = None,
                        default_quant_scheme: QuantScheme = QuantScheme.post_training_tf_enhanced,
-                       default_config_file: str = None) -> onnx_pb.ModelProto:
+                       default_config_file: str = None, use_cuda: bool = True, device: int = 0) -> onnx_pb.ModelProto:
         """
         Returns model with optimized weight rounding of every module (Conv and Linear) and also saves the
         corresponding quantization encodings to a separate JSON-formatted file that can then be imported by
@@ -128,11 +134,15 @@ class Adaround:
         :param default_quant_scheme: Quantization scheme. Supported options are using Quant Scheme Enum
                                     QuantScheme.post_training_tf or QuantScheme.post_training_tf_enhanced
         :param default_config_file: Default configuration file for model quantizers
+        :param use_cuda: If we should use cuda
+        :param device: CUDA device ID
         :return: Model with Adarounded weights and saves corresponding parameter encodings JSON file at provided path
         """
         # pylint: disable=too-many-arguments
         # Create Quant sim with given parameters
-        quant_sim = QuantizationSimModel(model, quant_scheme=default_quant_scheme,
+        if not isinstance(model, ONNXModel):
+            model = ONNXModel(model)
+        quant_sim = QuantizationSimModel(copy.deepcopy(model), quant_scheme=default_quant_scheme,
                                          default_param_bw=default_param_bw,
                                          config_file=default_config_file)
 
@@ -144,13 +154,13 @@ class Adaround:
             cls._exclude_modules(quant_sim, ignore_quant_ops_list)
 
         # Compute only param encodings
-        cls._compute_param_encodings(quant_sim)
+        cls._compute_param_encodings(quant_sim, params)
 
-        return cls._apply_adaround(quant_sim, model, params, path, filename_prefix)
+        return cls._apply_adaround(quant_sim, model, params, path, filename_prefix, use_cuda, device)
 
     @classmethod
     def _apply_adaround(cls, quant_sim: QuantizationSimModel, model: onnx_pb.ModelProto, params: AdaroundParameters,
-                        path: str, filename_prefix: str) -> onnx_pb.ModelProto:
+                        path: str, filename_prefix: str, use_cuda: bool = True, device: int = 0) -> onnx_pb.ModelProto:
         """
         Returns model with optimized weight rounding of every module (Conv and Linear) and also saves the
         corresponding quantization encodings to a separate JSON-formatted file that can then be imported by
@@ -162,6 +172,8 @@ class Adaround:
         :param params: Parameters for Adaround
         :param path: path where to store parameter encodings
         :param filename_prefix: Prefix to use for filename of the encodings file
+        :param use_cuda: If we should use cuda
+        :param device: CUDA device ID
         :return: Model with Adarounded weights and saves corresponding parameter encodings JSON file at provided path
         """
 
@@ -172,7 +184,7 @@ class Adaround:
         # Get the module - activation function pair using ConnectedGraph
         module_act_func_pair = get_module_act_func_pair(model)
 
-        cls._adaround_model(model, quant_sim, module_act_func_pair, params)
+        cls._adaround_model(model, quant_sim, module_act_func_pair, params, use_cuda, device)
 
         # Export quantization encodings to JSON-formatted file
         cls._export_encodings_to_json(path, filename_prefix, quant_sim)
@@ -183,15 +195,18 @@ class Adaround:
 
     @classmethod
     def _adaround_model(cls, model: onnx_pb.ModelProto, quant_sim: QuantizationSimModel, module_act_func_pair: Dict,
-                        params: AdaroundParameters):
+                        params: AdaroundParameters, use_cuda: bool = True, device: int = 0):
         """
         Optimize weight rounding of every module (AdaroundSupportedModules) of model in sequential manner
         based on occurrence
+
         :param model: Original fp32 model from which quant_sim was created.
         :param quant_sim: QuantizationSimModel object to optimize weight rounding.
                           The activation quantizers are expected to have been disabled.
         :param module_act_func_pair: Dictionary of module to immediate following activation function
         :param params: Adaround parameters
+        :param use_cuda: If we should use cuda
+        :param device: CUDA device ID
         """
         # pylint: disable=too-many-locals, protected-access
 
@@ -216,9 +231,22 @@ class Adaround:
             # Optimization Hyper parameters
             opt_params = AdaroundHyperParameters(num_iterations, params.reg_param, params.beta_range,
                                                  params.warm_start)
-
+            param_to_tensor_quantizer_dict = Adaround._create_param_to_tensor_quantizer_dict(quant_sim)
+            model_data = ModelData(model.model)
+            quantized_layer_to_input_tensor_name = Adaround._get_quantized_layer_input_tensor_name(quant_sim)
             # AdaRound must be applied to modules in the order of occurrence
             modules = get_ordered_ops(model)
+            for module in tqdm(modules):
+                if module.type in AdaroundSupportedModules:
+                    name = module.name
+                    # Get module's next following activation function
+                    act_func = module_act_func_pair[name]
+                    quantized_input_name = quantized_layer_to_input_tensor_name[name]
+                    logger.info("Started Optimizing weight rounding of module: %s", name)
+                    AdaroundOptimizer.adaround_module(model_data.module_to_info[name], quantized_input_name,
+                                                      model, quant_sim.model, act_func,
+                                                      cached_dataset, opt_params, param_to_tensor_quantizer_dict,
+                                                      use_cuda, device)
 
         finally:
             if os.path.exists(WORKING_DIR):
@@ -226,20 +254,26 @@ class Adaround:
                 shutil.rmtree(WORKING_DIR)
 
     @staticmethod
-    def _compute_param_encodings(quant_sim: QuantizationSimModel):
+    def _compute_param_encodings(quant_sim: QuantizationSimModel, params: AdaroundParameters):
         """
         Compute encodings for parameters, needed for initializing Adaround quantizers
+
         :param quant_sim: Quant sim
+        :param params: Adaround params
         """
         for op_name, qc_op in quant_sim.qc_quantize_op_dict.items():
-            if op_name in quant_sim.param_names:
+            if op_name in quant_sim.activation_names:
+                qc_op.enabled = False
+            else:
                 qc_op.op_mode = OpMode.oneShotQuantizeDequantize
+
+        params.forward_fn(quant_sim.session, params.forward_pass_callback_args)
+        for op_name, qc_op in quant_sim.qc_quantize_op_dict.items():
+            if op_name in quant_sim.param_names:
                 qc_op.compute_encodings()
                 qc_op.op_mode = OpMode.quantizeDequantize
 
-
     @staticmethod
-    @contextlib.contextmanager
     def _create_param_to_tensor_quantizer_dict(quant_sim: QuantizationSimModel) -> Dict[str, AdaroundTensorQuantizer]:
         """
         Create Adaround tensor quantizers for weight tensor
@@ -260,7 +294,7 @@ class Adaround:
             adaround_quantizer.use_unsigned_symmetric = quantizer.use_unsigned_symmetric
 
             # Set the encodings and replace by Adaround tensor quantizer
-            adaround_quantizer.encoding = quantizer.encoding
+            adaround_quantizer.encoding = quantizer.encodings
             param_to_tq_dict[param_name] = adaround_quantizer
 
         return param_to_tq_dict
@@ -269,27 +303,28 @@ class Adaround:
     def _export_encodings_to_json(cls, path: str, filename_prefix: str, quant_sim: QuantizationSimModel):
         """
         Save Adadrounded module's parameter encodings to JSON file
+
         :param path: path where to store param encodings
         :param filename_prefix: filename to store exported weight encodings in JSON format
         :param quant_sim: QunatSim that contains the model and Adaround tensor quantizers
         """
+        # pylint: disable=protected-access
+        def update_encoding_dict_entry(encoding_dict: Dict, op_name: str):
+            qc_quantize_op = quant_sim.qc_quantize_op_dict[op_name]
+            encoding_dict[op_name] = []
+            for encoding in qc_quantize_op.encodings:
+                encoding_dict[op_name].append(QuantizationSimModel._create_encoding_dict(encoding, qc_quantize_op))
 
-    @classmethod
-    def _update_param_encodings_dict(cls, quant_module, name: str, param_encodings: Dict):
-        """
-        Add module's weight parameter encodings to dictionary to be used for exporting encodings
-        :param quant_module: quant module
-        :param name: name of module
-        :param param_encodings: Dictionary of param encodings
-        """
+        param_encodings = {}
+        for name in quant_sim.param_names:
+            if quant_sim.qc_quantize_op_dict[name].enabled:
+                update_encoding_dict_entry(param_encodings, name)
 
-    @staticmethod
-    def _create_encodings_dict_for_quantizer(quantizer: TensorQuantizer) -> List[Dict]:
-        """
-        Return encodings for given qunatizer
-        :param quantizer: Tensor quantizer associated with module's param
-        :return: Dictionary containing encodings
-        """
+        # export encodings to JSON file
+        os.makedirs(os.path.abspath(path), exist_ok=True)
+        encoding_file_path = os.path.join(path, filename_prefix + '.encodings')
+        with open(encoding_file_path, 'w') as encoding_fp:
+            json.dump(param_encodings, encoding_fp, sort_keys=True, indent=4)
 
     @staticmethod
     def _override_param_bitwidth(quant_sim: QuantizationSimModel,
@@ -318,3 +353,11 @@ class Adaround:
         :param ignore_quant_ops_list: The list of quantizers for which the Quantization wrappers are removed from the
                                       QuantSim object.
         """
+
+    @staticmethod
+    def _get_quantized_layer_input_tensor_name(sim):
+        quantized_layer_to_input_tensor_name = {}
+        for node in sim.model.model.graph.node:
+            if node.op_type in AdaroundSupportedModules:
+                quantized_layer_to_input_tensor_name[node.name] = node.input[0]
+        return quantized_layer_to_input_tensor_name

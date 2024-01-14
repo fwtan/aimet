@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -37,12 +36,19 @@
 # =============================================================================
 """ Utilities for ONNX Connected Graph """
 from typing import Dict, List
-from onnx import onnx_pb
+import onnx
+from packaging import version
 
 from aimet_onnx.meta.connectedgraph import ConnectedGraph
 
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import ModelProto
+else:
+    from onnx.onnx_pb import ModelProto
 
-ActivationTypes = ['Relu', 'Clip', 'Sigmoid', 'Tanh']
+
+ActivationTypes = ['Relu', 'Clip', 'Sigmoid', 'Tanh', 'PRelu', 'Softmax']
 
 
 def get_op_given_param_name(connected_graph: ConnectedGraph, param_name: str):
@@ -76,7 +82,7 @@ def get_param_shape_using_connected_graph(connected_graph: ConnectedGraph, param
                     return param.shape
     return None
 
-def get_module_act_func_pair(model: onnx_pb.ModelProto) -> Dict[str, str]:
+def get_module_act_func_pair(model: ModelProto) -> Dict[str, str]:
     """
     For given model, returns dictionary of module to immediate following activation function else maps
     module to None.
@@ -97,27 +103,19 @@ def get_module_act_func_pair(model: onnx_pb.ModelProto) -> Dict[str, str]:
 
     for op in all_ops.values():
 
-        # Get module associated with op
-        cur_module = op.get_module()
+        module_act_func_pair[op.name] = None
 
-        if cur_module:
-            module_act_func_pair[cur_module] = None
-
-            if op.output:
-                assert op.output.consumers, 'op output should have at least one consumer op.'
-                # Get the next op
-                next_op = op.output.consumers[0]
-                # Get module associated with next op
-                next_module = next_op.get_module()
-
-                # Get the appropriate activation function
-                if next_module.type in ActivationTypes:
-                    module_act_func_pair[cur_module] = next_module
+        if op.output and op.output.consumers:
+            # Get the next op
+            next_op = op.output.consumers[0]
+            # Get the appropriate activation function
+            if next_op.type in ActivationTypes:
+                module_act_func_pair[op.name] = next_op.type
 
     return module_act_func_pair
 
 
-def get_ordered_ops(model: onnx_pb.ModelProto) -> List:
+def get_ordered_ops(model: ModelProto) -> List:
     """
     Gets list of ordered ops
 

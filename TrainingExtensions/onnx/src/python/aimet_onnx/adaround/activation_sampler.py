@@ -1,4 +1,3 @@
-# /usr/bin/env python3.6
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -41,12 +40,19 @@
 from typing import Tuple, List, Dict, Union
 
 import numpy as np
-from onnx import onnx_pb
 import onnxruntime as ort
+import onnx
+from packaging import version
 
 from aimet_common.utils import AimetLogger
 from aimet_onnx.quantsim import QuantizationSimModel
 from aimet_onnx.utils import add_hook_to_get_activation, remove_activation_hooks, create_input_dict
+
+# pylint: disable=no-name-in-module, ungrouped-imports
+if version.parse(onnx.__version__) >= version.parse("1.14.0"):
+    from onnx import ModelProto
+else:
+    from onnx.onnx_pb import ModelProto
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -57,13 +63,13 @@ class ActivationSampler:
     collect the module's output and input activation data respectively
     """
     def __init__(self, orig_op: str, quant_op: str,
-                 orig_model: onnx_pb.ModelProto, quant_model: QuantizationSimModel, use_cuda: bool,
+                 orig_model: ModelProto, quant_model: QuantizationSimModel, use_cuda: bool,
                  device: int = 0):
         """
         :param orig_op: Single un quantized op from the original session
         :param quant_op: Corresponding quant op from the Quant sim session
-        :param orig_session: Session with the original model
-        :param quant_session: Session with the model with quantization simulations ops
+        :param orig_model: Session with the original model
+        :param quant_model: Session with the model with quantization simulations ops
         :param use_cuda: If we should use cuda
         :param device: CUDA device ID
         :return: Input data to quant op, Output data from original op
@@ -81,7 +87,7 @@ class ActivationSampler:
         self._orig_module_collector = ModuleData(orig_model, orig_op, self.providers)
         self._quant_module_collector = ModuleData(quant_model, quant_op, self.providers)
 
-    def sample_and_place_all_acts_on_cpu(self, cached_dataset) -> Tuple:
+    def sample_and_place_all_acts_on_cpu(self, dataset) -> Tuple:
         """
         From the original module, collect output activations and input activations
         to corresponding quantized module.
@@ -89,21 +95,21 @@ class ActivationSampler:
         NOTE: Keeps collected activation data on CPU memory so this function should only be invoked
         if collected activation data can be fit entirely in CPU memory.
 
-        :param cached_dataset: Cached dataset.
+        :param dataset: Cached dataset.
         :return: Input data, output data
         """
         all_inp_data = []
         all_out_data = []
 
-        iterator = iter(cached_dataset)
-        for batch_index in range(len(cached_dataset)):
+        iterator = iter(dataset)
+        for batch_index in range(len(dataset)):
             model_inputs = next(iterator)
             inp_data, out_data = self.sample_acts(create_input_dict(self._org_model.model, model_inputs))
 
-            all_inp_data.append(inp_data)
-            all_out_data.append(out_data)
+            all_inp_data.append(inp_data[0])
+            all_out_data.append(out_data[0])
 
-            if batch_index == len(cached_dataset) - 1:
+            if batch_index == len(dataset) - 1:
                 break
 
         return all_inp_data, all_out_data
@@ -133,7 +139,7 @@ class ModuleData:
     Collect input and output data to and from module
     """
 
-    def __init__(self, model: onnx_pb.ModelProto, node_name: str, providers: List):
+    def __init__(self, model: ModelProto, node_name: str, providers: List):
         """
         :param session: ONNX session
         :param node: Module reference
@@ -163,3 +169,4 @@ class ModuleData:
             return None, outputs
         if collect_input:
             return outputs, None
+        return None, None

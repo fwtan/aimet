@@ -1,4 +1,3 @@
-# /usr/bin/env python3.8
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -38,11 +37,12 @@
 
 """ Implementation for simulating models running on Quantized hardware """
 # pylint: disable=too-many-lines
+import contextlib
 import os
 import io
 import copy
 import pickle
-from typing import Tuple, List, Union, Dict, Callable, Optional
+from typing import Tuple, List, Union, Dict, Callable, Optional, Any
 from collections.abc import Iterable
 import json
 import torch
@@ -137,13 +137,13 @@ class QuantizationSimModel:
     inference accuracy. Also allows the model to be fine-tuned to counter the effects of quantization.
     """
 
-    # pylint: disable=too-many-arguments, too-many-instance-attributes, too-many-locals
+    # pylint: disable=too-many-arguments, too-many-instance-attributes, too-many-locals, too-many-public-methods
     def __init__(self, model: torch.nn.Module, dummy_input: Union[torch.Tensor, Tuple],
                  quant_scheme: Union[str, QuantScheme] = QuantScheme.post_training_tf_enhanced,
                  rounding_mode: str = 'nearest', default_output_bw: int = 8, default_param_bw: int = 8,
                  in_place: bool = False, config_file: str = None,
-                 default_data_type: QuantizationDataType = QuantizationDataType.int,
-                 master_opdef_file: str = None, backend_opdef_files: List[str] = None):
+                 default_data_type: QuantizationDataType = QuantizationDataType.int):
+
         """
         Constructor for QuantizationSimModel.
 
@@ -162,10 +162,6 @@ class QuantizationSimModel:
                                  Possible options are QuantizationDataType.int and QuantizationDataType.float.
                                  Note that the mode default_data_type=QuantizationDataType.float is only supported with
                                  default_output_bw=16 and default_param_bw=16
-        :param master_opdef_file: Path to xml file for master ops definition
-        :param backend_opdef_files: List of paths to xml file for backend ops definition
-                                    The bitwidth, datatype applied in case of no matching found
-                                    will be taken according to the order of xml provided
         """
         # Perform sanity checks on inputs
         validate_quantsim_inputs(quant_scheme, rounding_mode, default_output_bw, default_param_bw,
@@ -199,6 +195,7 @@ class QuantizationSimModel:
 
         # Add quantization layers
         num_inout_tensors = utils.find_num_inout_tensors_per_module(self.model, dummy_input)
+        inout_tensors_dtypes_for_cast_ops = utils.get_inout_tensors_dtypes_for_cast_modules(self.model, dummy_input)
 
         self._add_quantization_wrappers(self.model, num_inout_tensors, default_data_type)
         self._set_tensor_quantizers_for_consts()
@@ -214,20 +211,12 @@ class QuantizationSimModel:
 
         self.quant_args = extract_global_quantizer_args(quant_scheme, quantsim_configurator)
 
+        self._enable_output_quantizers_for_specific_cast_ops(inout_tensors_dtypes_for_cast_ops)
+
         # pylint: disable=protected-access
         self._hw_version = quantsim_configurator._get_hw_version()
-
-        if master_opdef_file is not None and backend_opdef_files is not None:
-            try:
-                from aimet_common.backend_aware_quantsim_utility import populate_backend_info, QuantsimInfo
-                quantsim_info = QuantsimInfo(self._default_output_bw, self._default_param_bw, default_data_type)
-                self._supported_kernels = populate_backend_info(self.model, quantsim_configurator.get_module_names(),
-                                                                master_opdef_file, backend_opdef_files, quantsim_info)
-            except ImportError:
-                raise ImportError('Modules for backend aware quantization not found.')
-        else:
-            self._supported_kernels = quantsim_configurator.get_supported_kernels()
-            self._validate_supported_kernels_for_quantizers(SUPPORTED_KERNELS_ACTION)
+        self._supported_kernels = quantsim_configurator.get_supported_kernels()
+        self._validate_supported_kernels_for_quantizers(SUPPORTED_KERNELS_ACTION)
 
     def get_supported_kernels(self) -> Dict:
         """
@@ -285,6 +274,53 @@ class QuantizationSimModel:
 
         return stream.getvalue()
 
+    @staticmethod
+    def prepare_sim_for_compute_encodings(sim: 'QuantizationSimModel'):
+        """
+        Prepare QuantSim for compute encodings. Resets encodings for each quantizable layer and sets mode to Analysis.
+
+        :param sim: QuantSim to prepare
+        """
+        # pylint: disable=protected-access
+        quantized_layers = sim._get_qc_quantized_layers(sim.model)
+
+        for _, layer in quantized_layers:
+            # Clear stats and encodings if they are present
+            layer.reset_encodings()
+
+            # And set the mode to analysis
+            layer.set_mode(QcQuantizeOpMode.ANALYSIS)
+
+        for _, layer in quantized_layers:
+            # call only when quant scheme is percentile
+            if sim._quant_scheme == QuantScheme.post_training_percentile:
+                layer.set_percentile_value(sim._percentile_value)
+
+    @staticmethod
+    def compute_layer_encodings_for_sim(sim: 'QuantizationSimModel'):
+        """
+        Compute encodings for each quantizable layer in sim after forward pass has been called.
+
+        :param sim: QuantSim to compute encodings for
+        """
+        # pylint: disable=protected-access
+        quantized_layers = sim._get_qc_quantized_layers(sim.model)
+        # Get the computed per-layer encodings and log them
+        for name, layer in quantized_layers:
+            layer.compute_encoding()
+
+            # Before we return we set the mode to active - meaning ready for quantize/de-quantize
+            # for layers with valid_encoding, otherwise we set to pass through
+            if isinstance(layer, QcQuantizeRecurrent):
+                sim.set_mode_for_recurrent_module(layer, name)
+            else:
+                # By default we want to set the Quantization wrappers to ACTIVE mode
+                layer.set_mode(QcQuantizeOpMode.ACTIVE)
+
+        sim.replace_wrappers_for_quantize_dequantize()
+
+        sim._clamp_transformer_attention_mask_encoding()
+
     def compute_encodings(self, forward_pass_callback, forward_pass_callback_args):
         """
         Computes encodings for all quantization sim nodes in the model. It is also used to find initial encodings for
@@ -302,40 +338,13 @@ class QuantizationSimModel:
 
         """
 
-        quantized_layers = self._get_qc_quantized_layers(self.model)
-
-        for _, layer in quantized_layers:
-            # Clear stats and encodings if they are present
-            layer.reset_encodings()
-
-            # And set the mode to analysis
-            layer.set_mode(QcQuantizeOpMode.ANALYSIS)
-
-        for _, layer in quantized_layers:
-            # call only when quant scheme is percentile
-            if self._quant_scheme == QuantScheme.post_training_percentile:
-                layer.set_percentile_value(self._percentile_value)
+        QuantizationSimModel.prepare_sim_for_compute_encodings(self)
 
         # Run forward iterations so we can collect statistics to compute the appropriate encodings
         with utils.in_eval_mode(self.model), torch.no_grad():
             _ = forward_pass_callback(self.model, forward_pass_callback_args)
 
-        # Get the computed per-layer encodings and log them
-        for name, layer in quantized_layers:
-            layer.compute_encoding()
-
-            # Before we return we set the mode to active - meaning ready for quantize/de-quantize
-            # for layers with valid_encoding, otherwise we set to pass through
-            if isinstance(layer, QcQuantizeRecurrent):
-                self.set_mode_for_recurrent_module(layer, name)
-
-            else:
-                # By default we want to set the Quantization wrappers to ACTIVE mode
-                layer.set_mode(QcQuantizeOpMode.ACTIVE)
-
-        self.replace_wrappers_for_quantize_dequantize()
-
-        self._clamp_transformer_attention_mask_encoding()
+        QuantizationSimModel.compute_layer_encodings_for_sim(self)
 
     @classmethod
     def set_mode_for_recurrent_module(cls, layer: QcQuantizeRecurrent, name: str):
@@ -520,6 +529,17 @@ class QuantizationSimModel:
         :param path: Path to save file
         :param filename_prefix: Filename to use for saved file
         """
+        activation_encodings, param_encodings = self.get_activation_param_encodings()
+        encodings_dict = {'activation_encodings': activation_encodings, 'param_encodings': param_encodings}
+        with open(os.path.join(path, filename_prefix + '.json'), 'w') as encoding_json:
+            json.dump(encodings_dict, encoding_json, sort_keys=True, indent=4)
+
+    def get_activation_param_encodings(self):
+        """
+        Get activation and param encodings from sim.model.
+
+        :return: Tuple of activation and param encodings dictionaries mapping torch module names to encodings
+        """
         activation_encodings = {}
         param_encodings = {}
         for layer_name, layer in QuantizationSimModel._get_qc_quantized_layers(self.model):
@@ -543,10 +563,7 @@ class QuantizationSimModel:
 
             for orig_param_name, param_quantizer in layer.param_quantizers.items():
                 self._save_param_encoding(layer_name, orig_param_name, param_quantizer, param_encodings)
-
-        encodings_dict = {'activation_encodings': activation_encodings, 'param_encodings': param_encodings}
-        with open(os.path.join(path, filename_prefix + '.json'), 'w') as encoding_json:
-            json.dump(encodings_dict, encoding_json, sort_keys=True, indent=4)
+        return activation_encodings, param_encodings
 
     @staticmethod
     def _save_activation_encoding(layer_name: str, quantizer_identifier: Union[str, int],
@@ -1585,6 +1602,27 @@ class QuantizationSimModel:
         return QuantSimConfigurator(self.model, self.connected_graph, config_file, default_output_bw,
                                     default_param_bw, default_data_type)
 
+    def load_and_freeze_encodings(self, encoding_path: str):
+        """
+        Functionality to set encodings (both activation and parameter) as per the given encodings JSON file and
+        freeze them.
+
+        :param encoding_path: JSON file path from where to load the encodings.
+        """
+        with open(encoding_path, mode='r') as json_file:
+            encodings_dict = json.load(json_file)
+
+        params_encoding = encodings_dict['param_encodings']
+        activation_encoding = encodings_dict['activation_encodings']
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, QcQuantizeWrapper):
+                module.set_param_encoding(name, params_encoding)
+                module.freeze_param_encoding(name, params_encoding)
+
+                module.set_activation_encoding(name, activation_encoding)
+                module.freeze_activation_encoding(name, activation_encoding)
+
     def set_and_freeze_param_encodings(self, encoding_path: str):
         """
         Set and freeze parameter encodings from encodings JSON file
@@ -1667,7 +1705,7 @@ class QuantizationSimModel:
             """
             if action != SupportedKernelsAction.allow_error:
                 for k in allowed_supported_kernels:
-                    if k.is_same_activation(act[0], act[1]):
+                    if k.is_same_activation(act[1], act[0]):
                         return
 
                 if action == SupportedKernelsAction.warn_on_error:
@@ -1684,10 +1722,13 @@ class QuantizationSimModel:
                 for supported_kernel in module.supported_kernels:
                     # ((activation bitwidth, activation data type), (param bitwidth, param data type))
                     # TODO modify this once reformat_supported_kernels generates of type QuantDtypeBwInfo
-                    supported_kernels.append(
-                        QuantDtypeBwInfo(supported_kernel[0][1], supported_kernel[0][0],
-                                         supported_kernel[1][1], supported_kernel[1][0]))
-
+                    if isinstance(supported_kernel[1], tuple):
+                        supported_kernels.append(
+                            QuantDtypeBwInfo(supported_kernel[0][1], supported_kernel[0][0],
+                                             supported_kernel[1][1], supported_kernel[1][0]))
+                    else:
+                        supported_kernels.append(
+                            QuantDtypeBwInfo(supported_kernel[1], supported_kernel[0]))
                 act_candidates = []
                 param_candidate = ()
                 for quantizer in module.input_quantizers + module.output_quantizers:
@@ -1781,6 +1822,28 @@ class QuantizationSimModel:
         else:
             _validate_torchquantizer(quant_sim_model)
             OnnxSaver._export_model_to_onnx(quant_sim_model, dummy_input, model_path, is_conditional, onnx_export_args) # pylint: disable=protected-access
+
+    def _enable_output_quantizers_for_specific_cast_ops(self, inout_tensors_dtypes: Dict[torch.nn.Module, Tuple[torch.dtype, torch.dtype]]):
+        """
+        Enable output quantizer for Cast Ops where datatype of input tensor is int/bool
+        and data type of output tensor is float.
+        """
+        # pylint: disable=protected-access
+        model_prefix = self.connected_graph._model_name + '.'
+        torch_int_dtypes = {torch.int8, torch.int16, torch.int32, torch.int64, torch.bool, torch.uint8}
+        torch_float_dtypes = {torch.float16, torch.float32, torch.float64}
+
+        for module, inout_dtypes in inout_tensors_dtypes.items():
+            input_tensor_dtype = inout_dtypes[0]
+            output_tensor_dtype = inout_dtypes[1]
+            # pylint: disable=protected-access
+            module_name = self.connected_graph._module_to_name[module].split(model_prefix)[-1]
+
+            if input_tensor_dtype != output_tensor_dtype and input_tensor_dtype in torch_int_dtypes and output_tensor_dtype in torch_float_dtypes:
+                logger.info("Enabling output quantizer for module %s", module_name)
+                wrapped_module = getattr(self.model, module_name)
+                for output_quantizer in wrapped_module.output_quantizers:
+                    setattr(output_quantizer, 'enabled', True)
 
 
 def save_checkpoint(quant_sim_model: QuantizationSimModel, file_path: str):
@@ -1915,3 +1978,36 @@ def has_valid_encodings(qc_quantize_op: Union[QcQuantizeWrapper, QcQuantizeRecur
             return True
 
     return False
+
+
+def compute_encodings_for_sims(sim_list: List[QuantizationSimModel], forward_pass_callback: Callable,
+                               forward_pass_callback_args: Any):
+    """
+    Compute encodings for a list of QuantSims.
+
+    :param sim_list: List of QuantSims to compute encodings for.
+    :param forward_pass_callback: A callback function that simply runs forward passes on the models. This callback
+        function should use representative data for the forward pass, so the calculated encodings work for all
+        data samples. This callback internally chooses the number of data samples it wants to use for calculating
+        encodings.
+        The callback expects exactly two inputs:
+            - List of models which are involved in the forward pass. The models are taken directly from calling
+            sim.model for each sim in sim_list, passed in the same order in which the sims appear in sim_list.
+            - Forward pass callback args
+    :param forward_pass_callback_args: These argument(s) are passed to the forward_pass_callback as-is. Up to
+        the user to determine the type of this parameter. E.g. could be simply an integer representing the number
+        of data samples to use. Or could be a tuple of parameters or an object representing something more complex.
+        If set to None, forward_pass_callback will be invoked with no parameters.
+    """
+    ctx_managers = [torch.no_grad()]
+    for sim in sim_list:
+        ctx_managers.append(utils.in_eval_mode(sim.model))
+        QuantizationSimModel.prepare_sim_for_compute_encodings(sim)
+
+    with contextlib.ExitStack() as stack:
+        for mgr in ctx_managers:
+            stack.enter_context(mgr)
+        _ = forward_pass_callback([sim.model for sim in sim_list], forward_pass_callback_args)
+
+    for sim in sim_list:
+        QuantizationSimModel.compute_layer_encodings_for_sim(sim)

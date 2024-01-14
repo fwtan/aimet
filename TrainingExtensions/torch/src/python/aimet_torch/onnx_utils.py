@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -49,6 +48,7 @@ from enum import IntEnum
 import torch
 import torch.nn as nn
 import torch.onnx.symbolic_caffe2
+import torchvision
 import onnx
 import onnxsim
 import yaml
@@ -68,6 +68,10 @@ _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 # this flag in such circumstances.
 EXPORT_TO_ONNX_DIRECT = False
 
+# Flag to enable restoring pruned initializers in ONNX graph
+# By default, the flag is disabled because it is rare case we should restore initializers in most cases
+RESTORE_ONNX_MODEL_INITIALIZERS = False
+
 # runs the second pass of markers for non-leaf torch module and updates names of onnx ops belonging to
 # non-leaf pytorch module
 update_all_onnx_nodes_name = True
@@ -79,65 +83,73 @@ recurrent_onnx_optypes = ['LSTM', 'GRU', 'RNN']
 
 # This is a dict that maps a PyTorch module type to the corresponding ONNX op type (as a string)
 map_torch_types_to_onnx = {
-    nn.Conv1d: ['Conv'],
-    nn.Conv2d: ['Conv'],
-    nn.Dropout: ['Dropout'],
-    nn.Dropout2d: ['Dropout'],
-    nn.BatchNorm1d: ['BatchNormalization'],
-    nn.BatchNorm2d: ['BatchNormalization'],
-    # Note - Currently, both LayerNorm and GELU are not in the supported ops list in ONNX
-    # Adding this entry here for usage by Connected graph
-    nn.LayerNorm: ['LayerNorm'],
-    nn.GroupNorm: ['GroupNorm'],
-    nn.GELU: ['GELU'],
-    nn.ReLU: ['Relu'],
-    nn.ReLU6: ['Clip'],
-    nn.MaxPool2d: ['MaxPool'],
-    nn.Linear: ['Gemm', 'MatMul'],
     nn.AdaptiveAvgPool2d: ['GlobalAveragePool', 'AveragePool'],
     nn.AvgPool2d: ['AveragePool'],
-    nn.LogSoftmax: ['LogSoftmax'],
-    nn.RNN:  ['RNN'],
-    nn.LSTM: ['LSTM'],
-    nn.GRU: ['GRU'],
-    nn.ConvTranspose2d: ['ConvTranspose'],
-    nn.Sigmoid: ['Sigmoid'],
-    nn.Upsample: ['Upsample'],
-    nn.PReLU: ['PRelu'],
-    nn.LeakyReLU: ['LeakyRelu'],
-    nn.Flatten: ['Flatten'],
-    nn.Softmax: ['Softmax'],
-    nn.Tanh: ['Tanh'],
-    nn.Embedding: ['Gather'],
-    nn.Softplus: ['Softplus'],
-    nn.Hardswish: ['HardSwish'],
+    nn.BatchNorm1d: ['BatchNormalization'],
+    nn.BatchNorm2d: ['BatchNormalization'],
     nn.ChannelShuffle: ['ChannelShuffle'],
+    nn.Conv1d: ['Conv'],
+    nn.Conv2d: ['Conv'],
+    nn.ConvTranspose2d: ['ConvTranspose'],
+    nn.Dropout: ['Dropout'],
+    nn.Dropout2d: ['Dropout'],
+    nn.Embedding: ['Gather'],
+    nn.Flatten: ['Flatten'],
+    nn.GELU: ['GELU'],                  # Not a supported op in ONNX, adding this entry for usage by Connected Graph
+    nn.GroupNorm: ['GroupNorm'],
+    nn.GRU: ['GRU'],
+    nn.Hardswish: ['HardSwish'],
+    nn.MaxPool2d: ['MaxPool'],
     nn.MaxPool3d: ['MaxPool'],
+    nn.LayerNorm: ['LayerNorm'],        # Not a supported op in ONNX, adding this entry for usage by Connected Graph
+    nn.InstanceNorm2d: ['InstanceNormalization'],
+    nn.InstanceNorm1d: ['InstanceNormalization'],
+    nn.LeakyReLU: ['LeakyRelu'],
+    nn.Linear: ['Gemm', 'MatMul'],
+    nn.LogSoftmax: ['LogSoftmax'],
+    nn.LSTM: ['LSTM'],
+    nn.PixelShuffle: ['DepthToSpace'],
+    nn.PixelUnshuffle: ['SpaceToDepth'],
+    nn.PReLU: ['PRelu'],
+    nn.ReLU: ['Relu'],
+    nn.ReLU6: ['Clip'],
+    nn.RNN:  ['RNN'],
+    nn.Sigmoid: ['Sigmoid'],
+    nn.Softmax: ['Softmax'],
+    nn.Softplus: ['Softplus'],
+    nn.Tanh: ['Tanh'],
+    nn.Upsample: ['Upsample'],
+    nn.UpsamplingNearest2d: ['Upsample'],
     elementwise_ops.Add: ['Add'],
-    elementwise_ops.Subtract: ['Sub'],
-    elementwise_ops.Multiply: ['Mul'],
-    elementwise_ops.Divide: ['Div'],
     elementwise_ops.Cast: ['Cast'],
-    elementwise_ops.Concat: ['Concat'],
-    elementwise_ops.Reshape: ['Reshape'],
-    elementwise_ops.Pad: ['Pad'],
     elementwise_ops.ChannelShuffle: ['ChannelShuffle'],
-    elementwise_ops.Tile: ['Tile'],
-    elementwise_ops.TopK: ['TopK'],
-    elementwise_ops.IndexSelect: ['Gather'],
+    elementwise_ops.Concat: ['Concat'],
     elementwise_ops.CustomGather: ['Gather'],
+    elementwise_ops.DepthToSpaceDCRMode: ['DepthToSpace'],
+    elementwise_ops.Divide: ['Div'],
     elementwise_ops.Gather: ['Gather'],
     elementwise_ops.GatherNd: ['GatherND'],
-    elementwise_ops.Min: ['ReduceMin'],
+    elementwise_ops.IndexSelect: ['Gather'],
     elementwise_ops.Max: ['ReduceMax'],
-    elementwise_ops.StridedSlice: ['Slice'],
-    elementwise_ops.NonZero: ['NonZero'],
-    elementwise_ops.DepthToSpaceDCRMode: ['DepthToSpace'],
     elementwise_ops.MaxPool2d: ['MaxPool'],
+    elementwise_ops.Min: ['ReduceMin'],
+    elementwise_ops.Multiply: ['Mul'],
+    elementwise_ops.NonZero: ['NonZero'],
+    elementwise_ops.Pad: ['Pad'],
+    elementwise_ops.Permute: ['Transpose'],
+    elementwise_ops.Reshape: ['Reshape'],
+    elementwise_ops.RoiAlign: ['RoiAlign'],
+    elementwise_ops.ScatterElements: ['ScatterElements'],
     elementwise_ops.Split: ['Split'],
+    elementwise_ops.StridedSlice: ['Slice'],
+    elementwise_ops.Subtract: ['Sub'],
+    elementwise_ops.Tile: ['Tile'],
+    elementwise_ops.TopK: ['TopK'],
+    torchvision.ops.RoIPool: ['MaxRoiPool'],
+    elementwise_ops.Mean: ['ReduceMean'],
+    elementwise_ops.NonMaxSuppression: ['NonMaxSuppression'],
     elementwise_ops.Sum: ['ReduceSum'],
     elementwise_ops.MatMul: ['MatMul'],
-    elementwise_ops.Mean: ['ReduceMean'],
     elementwise_ops.Sqrt: ['Sqrt'],
     elementwise_ops.Neg: ['Neg'],
     elementwise_ops.Transpose: ['Transpose'],
@@ -222,6 +234,16 @@ class OnnxExportApiArgs:
         return {'opset_version': self.opset_version,
                 'input_names': self.input_names,
                 'output_names': self.output_names}
+
+
+@dataclass(frozen=True)
+class PrunedInitializerInfo:
+    """
+    Data carrier containing initializer to be added and identity node to be removed in ONNX graph
+    """
+    initializer: onnx.TensorProto
+    identity_node: onnx.NodeProto
+
 
 class MarkerAttr(IntEnum):
     """ Enumeration for the custom marker attribute to index into the onnx node """
@@ -339,6 +361,11 @@ class CustomMarker(torch.nn.Module):
             marked_dict_inputs[k] = t
         return marked_dict_inputs
 
+    def __getitem__(self, item):
+        """
+        method to allow forwarding request to the marked module
+        """
+        return self.marked_module[item]
 
     def __getattr__(self, name):
         """
@@ -1080,6 +1107,9 @@ class OnnxSaver:
         :return: Onnx model with optional simply pass
         """
         onnx_model = onnx.load(filepath)
+        if RESTORE_ONNX_MODEL_INITIALIZERS:
+            onnx_model = restore_onnx_graph_initializers(onnx_model, inplace=True)
+
         if simplify_onnx_model:
             onnx_model_simplified, check = onnxsim.simplify(onnx_model)
             if check:
@@ -1456,9 +1486,101 @@ class OnnxSaver:
             torch.onnx.export(model, dummy_input, temp_file, **kwargs)
         else:
             try:
-                remove_kwargs = ['enable_onnx_checker', 'example_outputs']
+                remove_kwargs = ['enable_onnx_checker', 'example_outputs', 'use_external_data_format']
                 for key in remove_kwargs:
                     kwargs.pop(key, None)
                 torch.onnx.export(model, dummy_input, temp_file, **kwargs)
             except torch.onnx.CheckerError:
                 _logger.warning("ONNX Checker has failed but ONNX graph is still generated.")
+
+
+def save_initializer_restored_onnx_graph(original_model_path: str,
+                                         restored_model_path: str):
+    """
+    Load original ONNX model path and save restored ONNX model to specific path
+
+    :param original_model_path: Path where the original ONNX artifact was stored
+    :param restored_model_path: Path to store restored ONNX artifact
+    """
+    model = onnx.load(original_model_path)
+    restored_model = restore_onnx_graph_initializers(model, inplace=True)
+    onnx.save(restored_model, restored_model_path)
+
+
+def restore_onnx_graph_initializers(model: onnx.ModelProto,
+                                    inplace: bool = False) -> onnx.ModelProto:
+    """
+    Copy original model and restore its pruned initializers
+
+    :param model: Original ONNX ModelProto
+    :param inplace: Whether to modify ModelProto by inplace manner or not
+    :return: Initializer restored ONNX ModelProto
+    """
+    # pylint: disable=protected-access, no-member
+    if not inplace:
+        model = copy.deepcopy(model)
+
+    onnx_graph = model.graph
+
+    initializers = OnnxSaver._get_all_initializers(onnx_graph)
+    initializer_names = [initializer.name for initializer in initializers]
+    pruned_initializer_map = _get_pruned_initializer_map(
+        onnx_graph, initializers, initializer_names
+    )
+
+    for node in onnx_graph.node:
+        for input_tensor in node.input:
+            _restore_pruned_initializer(
+                onnx_graph, input_tensor, pruned_initializer_map
+            )
+
+    return model
+
+
+def _get_pruned_initializer_map(onnx_graph: onnx.GraphProto,
+                                initializers: List[onnx.TensorProto],
+                                initializer_names: List[str]) -> Dict[str, PrunedInitializerInfo]:
+    """
+    Find pruned ONNX initializers by iterating Identity nodes
+
+    :param onnx_graph: ONNX graph
+    :param initializers: List of ONNX initializers
+    :param initializer_names: List of model initializer names
+    :return: Dictionary with output of identity node as key and PrunedInitializerInfo as value
+    """
+    pruned_initializer_map = {}
+    for node in onnx_graph.node:
+        if node.op_type == "Identity" and node.input[0] in initializer_names:
+            index = initializer_names.index(node.input[0])
+            initializer = copy.deepcopy(initializers[index])
+            pruned_initializer_map[node.output[0]] = PrunedInitializerInfo(
+                initializer, node
+            )
+
+    return pruned_initializer_map
+
+
+def _restore_pruned_initializer(onnx_graph: onnx.GraphProto,
+                                input_tensor: str,
+                                pruned_initializer_map: Dict[str, PrunedInitializerInfo],
+                                new_initializer_name: Optional[str] = None):
+    """
+    Create new Initializer and remove Identity node to restore pruned Initializer
+
+    :param onnx_graph: ONNX graph
+    :param input_tensor: Input tensor name
+    :param pruned_initializer_map: Dictionary with output of identity node as key and PrunedInitializerInfo as value
+    :param new_initializer_name: Name for new initializer
+    """
+    if result := pruned_initializer_map.get(input_tensor):
+        new_initializer = result.initializer
+        existing_identity_node = result.identity_node
+
+        new_initializer.name = new_initializer_name or input_tensor
+        onnx_graph.initializer.append(new_initializer)
+        onnx_graph.node.remove(existing_identity_node)
+        _logger.info(
+            "Added new Initializer `%s` and removed existing Identity node `%s`",
+            new_initializer.name,
+            existing_identity_node.name,
+        )

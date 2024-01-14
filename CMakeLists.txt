@@ -272,16 +272,21 @@ else()
   message(STATUS "Set ${AIMET_PYTHONPATH} in ${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-# FIXME
-# Better to include patchefl into docker image, although seems it is not trivial
-include(FetchContent)
-FetchContent_Declare(patchelf
-    URL "https://github.com/NixOS/patchelf/releases/download/0.15.0/patchelf-0.15.0-x86_64.tar.gz"
-)
-if(NOT patchelf_POPULATED)
-    FetchContent_Populate(patchelf)
-    set(PATCHELF_EXE ${patchelf_SOURCE_DIR}/bin/patchelf)
-    message(STATUS "patchelf: ${PATCHELF_EXE}")
+find_program(PATCHELF_EXE patchelf)
+if (PATCHELF_EXE)
+    message(STATUS "Found patchelf in '${PATCHELF_EXE}'")
+else()
+    # FIXME
+    # Better to include patchefl into docker image, although seems it is not trivial
+    include(FetchContent)
+    FetchContent_Declare(patchelf
+        URL "https://github.com/NixOS/patchelf/releases/download/0.15.0/patchelf-0.15.0-x86_64.tar.gz"
+    )
+    if(NOT patchelf_POPULATED)
+        FetchContent_Populate(patchelf)
+        set(PATCHELF_EXE ${patchelf_SOURCE_DIR}/bin/patchelf)
+        message(STATUS "patchelf: ${PATCHELF_EXE}")
+    endif()
 endif()
 
 # -------------------------------
@@ -295,11 +300,12 @@ endif(NOT DEFINED AIMET_PACKAGE_PATH)
 
 execute_process(COMMAND git config --get remote.origin.url WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE remote_url)
 if(NOT remote_url STREQUAL "")
-  message(STATUS "Repo Remote URL = ${remote_url}")
   string(REGEX REPLACE "\n$" "" remote_url "${remote_url}")
   # Remove the ".git" suffix from the remote repo URL
   string(REGEX REPLACE "\\.[^.]*$" "" remote_url ${remote_url})
-
+  string(REGEX REPLACE ".*@" "" remote_post ${remote_url})
+  set(remote_url "https://${remote_post}")
+  message(STATUS "Repo Remote URL = ${remote_url}")
   set(remote_url_cfg "\"${remote_url}\"")
   set(sw_version_cfg "\"${SW_VERSION}\"")
 
@@ -310,7 +316,7 @@ if(NOT remote_url STREQUAL "")
     # Run the install target first
     COMMAND "${CMAKE_COMMAND}" --build . --target install
     # Now run the packaging target to generate wheel files
-    COMMAND ${CMAKE_COMMAND} -DAIMET_PACKAGE_PATH=${AIMET_PACKAGE_PATH} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DENABLE_CUDA=${ENABLE_CUDA} -DENABLE_TENSORFLOW=${ENABLE_TENSORFLOW} -DENABLE_TORCH=${ENABLE_TORCH} -DENABLE_ONNX=${ENABLE_ONNX} -DPATCHELF_EXE=${PATCHELF_EXE} -P ${CMAKE_CURRENT_SOURCE_DIR}/packaging/package_aimet.cmake
+    COMMAND ${CMAKE_COMMAND} -DPYTHON3_EXECUTABLE=${Python3_EXECUTABLE} -DAIMET_PACKAGE_PATH=${AIMET_PACKAGE_PATH} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DENABLE_CUDA=${ENABLE_CUDA} -DENABLE_TENSORFLOW=${ENABLE_TENSORFLOW} -DENABLE_TORCH=${ENABLE_TORCH} -DENABLE_ONNX=${ENABLE_ONNX} -DPATCHELF_EXE=${PATCHELF_EXE} -P ${CMAKE_CURRENT_SOURCE_DIR}/packaging/package_aimet.cmake
   )
 else()
   message(STATUS "Repo Remote URL is blank. Skipping packageaimet target")
@@ -318,11 +324,22 @@ endif()
 
 add_subdirectory(ThirdParty)
 
-enable_testing()
+if (NOT (DEFINED ENABLE_TESTS))
+  message("Test build not explicitly disabled. Enabling implicitly")
+  set(ENABLE_TESTS ON CACHE BOOL "")
+endif(NOT (DEFINED ENABLE_TESTS))
+
+if (ENABLE_TESTS)
+    message("Compiling test targets enabled")
+    enable_testing()
+    add_subdirectory(NightlyTests)
+else (ENABLE_TESTS)
+    message("Compiling test targets disabled")
+endif()
+
 add_subdirectory(ModelOptimizations)
 add_subdirectory(TrainingExtensions)
 add_subdirectory(Examples)
-add_subdirectory(NightlyTests)
 add_subdirectory(Docs)
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Benchmarks")
   add_subdirectory(Benchmarks)

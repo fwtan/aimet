@@ -46,6 +46,8 @@ else (ENABLE_CUDA)
 
 endif (ENABLE_CUDA)
 
+add_subdirectory(python/models/customops)
+
 set_property(TEST OnnxTrainingExtensionTest
       APPEND PROPERTY ENVIRONMENT "${AIMET_PYTHONPATH}")
 

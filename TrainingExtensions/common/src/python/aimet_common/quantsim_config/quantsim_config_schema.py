@@ -1,4 +1,3 @@
-# /usr/bin/env python3.5
 # -*- mode: python -*-
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
@@ -229,7 +228,7 @@ QUANTSIM_CONFIG_SCHEMA = {
                                         "additionalProperties": False
                                     },
                                 },
-                                "required": ["activation", "param"],
+                                "required": ["activation"],
                                 "additionalProperties": False
                             },
                             "minItems": 1,
