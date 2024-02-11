@@ -40,7 +40,11 @@ add_custom_target(copy_examples
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/Docs_SOURCE/Examples)
 
 # Create a tarball archive of the Examples code
+# install(CODE "execute_process(COMMAND
+#                ${CMAKE_COMMAND} -E chdir ${AIMET_INSTALL_DIR}
+#                ${CMAKE_COMMAND} -E tar cvzf ${AIMET_EXAMPLES_DEST}.tar.gz ${CMAKE_CURRENT_SOURCE_DIR}/Examples)"
+#        )
 install(CODE "execute_process(COMMAND
                 ${CMAKE_COMMAND} -E chdir ${AIMET_INSTALL_DIR}
-                ${CMAKE_COMMAND} -E tar cvzf ${AIMET_EXAMPLES_DEST}.tar.gz ${CMAKE_CURRENT_SOURCE_DIR}/Examples)"
+                ${CMAKE_COMMAND} -E tar cvzf ${AIMET_EXAMPLES_DEST}.tar.gz ../../Examples)"
         )
