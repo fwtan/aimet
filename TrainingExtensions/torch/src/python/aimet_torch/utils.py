@@ -686,7 +686,8 @@ def change_tensor_device_placement(tensor_data: Union[torch.Tensor, List, Tuple]
     :param device: device
     :return: tensor_data with modified device placement
     """
-    return nested_map(tensor_data, lambda x: x.to(device=device))
+    return nested_map(tensor_data,
+                      lambda x: x.to(device=device) if isinstance(x, (torch.Tensor, torch.nn.Module)) else x)
 
 
 def nested_map(tensor, fn: Callable[[torch.Tensor], torch.Tensor]):
@@ -1044,3 +1045,62 @@ def get_inout_tensors_dtypes_for_cast_modules(model: torch.nn.Module, input_tens
 
     run_hook_for_layers_with_given_input(model, input_tensor, record_dtypes)
     return inout_dtypes_map
+
+
+def create_encoding_dict(encoding: libpymo.TfEncoding, quantizer, propagate_encodings: bool) -> Union[Dict, None]:
+    """
+    Create encoding dictionary from encoding object
+    :param encoding: Encoding of the quantizer
+    :param quantizer: Tensor Quantizer
+    :param propagate_encodings: If True, encoding entries for intermediate ops (when one PyTorch ops results in
+            multiple ONNX nodes) are filled with the same BW and data_type as the output tensor for that series of
+            ops.
+    :return: Encoding Dictionary
+    """
+    data_type, bitwidth = quantizer.data_type, quantizer.bitwidth
+
+    if data_type == QuantizationDataType.float:
+        enc_dict = {'bitwidth': bitwidth, 'dtype': "float"}
+    else:
+        if encoding:
+            if propagate_encodings:
+                # Shortened encodings will be filled into a layer that only exists due to expansion of PyTorch ops
+                # into multiple ONNX ops so that it's necessarily to use the same bitwidth and type
+                enc_dict = {'bitwidth': encoding.bw, 'dtype': "int"}
+            else:
+                encoding_min, encoding_max, bw, scale, offset = encoding.min, encoding.max, encoding.bw, \
+                                                                encoding.delta, encoding.offset
+                is_symmetric = quantizer.use_symmetric_encodings
+
+                enc_dict = {'min': encoding_min, 'max': encoding_max, 'scale': scale, 'offset': int(offset),
+                            'bitwidth': bw, 'is_symmetric': str(is_symmetric), 'dtype': "int"}
+        else:
+            enc_dict = None
+    return enc_dict
+
+
+def get_propagated_encoding_dict(encoding_dict: List[Dict[str, any]]) -> List[Dict[str, any]]:
+    """
+    Creates encoding dictionary for intermediate ops (when one PyTorch ops results in multiple ONNX nodes), which are
+    filled with the same BW and data_type as the output tensor for that series of ops.
+
+    :param encoding_dict: Encoding dictionary for the final output of the op
+    :return: Encoding dictionary for intermediate activations of the op
+    """
+    return [{"bitwidth": encoding_dict[0]["bitwidth"], "dtype": encoding_dict[0]["dtype"]}]
+
+
+def get_v1_quant_scheme_for_initialization(quant_scheme: QuantScheme) -> QuantScheme:
+    """
+    Convert v1 quant scheme into v1 quant scheme for initialization
+
+    :param quant_scheme: v1 quant scheme from quantsim init parameter
+    :return: v1 quant scheme for initialization
+    """
+    if quant_scheme == QuantScheme.training_range_learning_with_tf_init:
+        return QuantScheme.post_training_tf
+
+    if quant_scheme == QuantScheme.training_range_learning_with_tf_enhanced_init:
+        return QuantScheme.post_training_tf_enhanced
+
+    return quant_scheme
