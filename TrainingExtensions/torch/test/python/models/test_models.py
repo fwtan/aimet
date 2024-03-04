@@ -1206,3 +1206,48 @@ class ModelWithModuleList(torch.nn.Module):
 
     def forward(self, x):
         return self.m[0](x)
+
+
+class ModelWithSplitModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.split = elementwise_ops.Split()
+
+    def forward(self, *inputs):
+        return self.split(inputs[0], 2)
+
+
+class ModelWithReluAfterSplit(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.split_module = ModelWithSplitModule()
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
+        self.relu3 = nn.ReLU()
+
+    def forward(self, *inputs):
+        chunks = self.split_module(inputs[0])
+        return self.relu1(chunks[0]), self.relu2(chunks[1]), self.relu3(chunks[2])
+
+
+class ModuleList(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(256, 256) for _ in range(3))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = torch.nn.functional.relu(layer(x)) if i < 3 - 1 else layer(x)
+        return x
+
+
+class ModelWithReusedInitializers(torch.nn.Module):
+    def __init__(self, repetition):
+        super(ModelWithReusedInitializers, self).__init__()
+        self.modulelist = ModuleList()
+        self.repetition = repetition
+
+    def forward(self, x):
+        for i in range(self.repetition):
+            x = self.modulelist(x)
+        return x

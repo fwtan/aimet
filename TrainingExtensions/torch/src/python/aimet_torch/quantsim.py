@@ -51,6 +51,8 @@ from packaging import version
 
 import aimet_common
 import aimet_common.libpymo as libpymo
+
+from aimet_common.connected_graph.connectedgraph_utils import CG_SPLIT
 from aimet_common.utils import AimetLogger, save_json_yaml, log_with_error_and_assert_if_false
 from aimet_common.defs import QuantScheme, QuantizationDataType, SupportedKernelsAction, QuantDtypeBwInfo
 from aimet_common.quantsim import encoding_version, validate_quantsim_inputs, extract_global_quantizer_args
@@ -866,7 +868,7 @@ class QuantizationSimModel:
             if succeeding_op.get_module():
                 downstream_modules.append(succeeding_op.get_module())
 
-            elif succeeding_op.type == 'Split':
+            elif succeeding_op.type == CG_SPLIT:
                 downstream_modules += QuantizationSimModel._find_next_downstream_modules(succeeding_op)
 
         return downstream_modules
@@ -1596,12 +1598,14 @@ class QuantizationSimModel:
         return QuantSimConfigurator(self.model, self.connected_graph, config_file, default_output_bw,
                                     default_param_bw, default_data_type)
 
-    def load_and_freeze_encodings(self, encoding_path: str):
+    def load_and_freeze_encodings(self, encoding_path: str, ignore_when_quantizer_disabled: bool = False):
         """
         Functionality to set encodings (both activation and parameter) as per the given encodings JSON file and
         freeze them.
 
         :param encoding_path: JSON file path from where to load the encodings.
+        :param ignore_when_quantizer_disabled: ignore raising RuntimeError while setting encodings,
+        when quantizers are disabled.
         """
         with open(encoding_path, mode='r') as json_file:
             encodings_dict = json.load(json_file)
@@ -1611,10 +1615,10 @@ class QuantizationSimModel:
 
         for name, module in self.model.named_modules():
             if isinstance(module, QcQuantizeWrapper):
-                module.set_param_encoding(name, params_encoding)
+                module.set_param_encoding(name, params_encoding, ignore_when_quantizer_disabled=ignore_when_quantizer_disabled)
                 module.freeze_param_encoding(name, params_encoding)
 
-                module.set_activation_encoding(name, activation_encoding)
+                module.set_activation_encoding(name, activation_encoding, ignore_when_quantizer_disabled=ignore_when_quantizer_disabled)
                 module.freeze_activation_encoding(name, activation_encoding)
 
     def set_and_freeze_param_encodings(self, encoding_path: str):
@@ -1921,6 +1925,9 @@ def load_encodings_to_sim(quant_sim_model: QuantizationSimModel, pytorch_encodin
         if not isinstance(module, ExportableQuantModule):
             continue
 
+        if isinstance(module, QcQuantizeWrapper):
+            module.set_mode(QcQuantizeOpMode.ACTIVE)
+
         param_encoding = {
             param_name: param_encodings[f'{module_name}.{param_name}']
             for param_name, _ in module.param_quantizers.items()
@@ -1973,7 +1980,7 @@ def load_encodings_to_sim(quant_sim_model: QuantizationSimModel, pytorch_encodin
             if is_enabled(quantizer) and not is_initialized(quantizer):
                 logger.debug('No encoding loaded for output quantizer %s of layer %s', idx, name)
 
-    if type(quant_sim_model) == QuantizationSimModel: # pylint: disable=unidiomatic-typecheck
+    if isinstance(quant_sim_model, QuantizationSimModel):
         # Only for V1 quantsim
         quant_sim_model.replace_wrappers_for_quantize_dequantize()
 

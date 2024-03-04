@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2021-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -37,12 +37,12 @@
 
 """ Custom modules for functional operations defined under torch and torch.nn.functional packages """
 
-from typing import Callable, Any, Tuple, Union
 import itertools
-import torchvision
+from typing import Callable, Any, Tuple, Union, List
+
 import torch
 import torch.nn
-
+import torchvision
 
 
 def forward_function_wrapper(functional: Callable) -> Any:
@@ -83,8 +83,10 @@ Erf = create_wrapper_module('Erf', torch.erf)
 Sqrt = create_wrapper_module('Sqrt', torch.sqrt)
 Maximum = create_wrapper_module('Maximum', torch.maximum)
 Max = create_wrapper_module('Max', torch.max) # NOTE: Not elementwise
+AMax = create_wrapper_module('AMax', torch.amax)
 Minimum = create_wrapper_module('Minimum', torch.minimum)
 Min = create_wrapper_module('Min', torch.min) # NOTE: Not elementwise
+AMin = create_wrapper_module('AMin', torch.amin)
 Where = create_wrapper_module('Where', torch.where)
 Greater = create_wrapper_module('Greater', torch.gt)
 Less = create_wrapper_module('Less', torch.lt)
@@ -279,6 +281,24 @@ class CustomGather(torch.nn.Module):
         return torch.index_select(data, axis, indices.flatten()).reshape(target_shape)
 
 
+class DepthToSpaceCRDMode(torch.nn.Module):
+    """ Depthtospace op implementation in CRD mode """
+
+    def __init__(self, block_size: List):
+        super().__init__()
+        self.block_size_h = block_size[0]
+        self.block_size_w = block_size[1]
+
+    def forward(self, x: torch.Tensor) -> Any:
+        """
+        Forward-pass routine for DepthToSpace op in CRD mode
+        """
+        b, c, h, w = x.shape
+        tmp = torch.reshape(x, (b, c // (self.block_size_h * self.block_size_w), self.block_size_h, self.block_size_w, h, w))
+        tmp = torch.permute(tmp, (0, 1, 4, 2, 5, 3))
+        out = torch.reshape(tmp, (b, c // (self.block_size_h * self.block_size_w), h * self.block_size_h, w * self.block_size_w))
+        return out
+
 class DepthToSpaceDCRMode(torch.nn.Module):
     """ Depthtospace op implementation in DCR mode """
 
@@ -419,7 +439,7 @@ class GatherNd(torch.nn.Module):
             else batch_dims_shape + list(indices.shape)[self.batch_dims:-1] + list(data.shape)[self.batch_dims + indices.shape[-1]:])
 
         if torch.jit.is_tracing():
-            return torch.zeros(*output_shape)
+            return torch.zeros(*output_shape, device=data.device)
 
         output_data_buffer = []
 
@@ -433,7 +453,7 @@ class GatherNd(torch.nn.Module):
                 output_data_buffer.append(reshaped_data[(batch_dim, *gather_index)])
 
         if output_data_buffer[0].dim() == 0:
-            return torch.tensor(output_data_buffer).reshape(output_shape)
+            return torch.tensor(output_data_buffer, device=data.device).reshape(output_shape)
         return torch.cat(output_data_buffer).reshape(output_shape)
 
 
@@ -495,3 +515,13 @@ class Expand(torch.nn.Module):
         Forward-pass routine for Expand op
         """
         return tensor.expand(*args)
+
+
+class DynamicLinear(torch.nn.Module):
+    """Custom module for Dynamic Linear / FullyConnected Op"""
+    # pylint:disable=no-self-use
+    def forward(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward-pass routine for Dynamic Linear Op
+        """
+        return torch.nn.functional.linear(x, weight, bias)

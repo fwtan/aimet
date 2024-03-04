@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -36,6 +36,8 @@
 # =============================================================================
 import json
 import os
+import shutil
+
 import onnx.numpy_helper
 import torch
 import numpy as np
@@ -51,7 +53,7 @@ from aimet_onnx.quantsim import QuantizationSimModel, load_encodings_to_sim
 from aimet_onnx.qc_quantize_op import OpMode
 from aimet_onnx.utils import make_dummy_input
 from models.models_for_tests import SingleResidual
-from models.models_for_tests import build_dummy_model, single_residual_model, BNAfterConv, multi_input_with_constant_model , multi_output_model, custom_add_model
+from models.models_for_tests import build_dummy_model, single_residual_model, BNAfterConv, multi_input_with_constant_model , multi_output_model, custom_add_model, build_lstm_gru_dummy_model
 
 
 class DummyModel(SingleResidual):
@@ -219,6 +221,43 @@ class TestQuantSim:
 
         param_keys = list(encoding_data['param_encodings'].keys())
         assert param_keys == ['conv_b', 'conv_w', 'fc_b', 'fc_w']
+        for param in param_keys:
+            param_encodings_keys = list(encoding_data["param_encodings"][param][0].keys())
+            assert param_encodings_keys == ['bitwidth', 'dtype', 'is_symmetric', 'max', 'min', 'offset', 'scale']
+
+    def test_lstm_gru(self):
+        """Test for LSTM and GRU dummy model"""
+        model = build_lstm_gru_dummy_model()
+        sim = QuantizationSimModel(model)
+
+        for quantizer in sim.qc_quantize_op_dict:
+            sim.qc_quantize_op_dict[quantizer].enabled = True
+
+        def callback(session, args):
+            in_tensor = {'input': np.random.rand(1, 8, 64).astype(np.float32)}
+            session.run(None, in_tensor)
+
+        sim.compute_encodings(callback, None)
+
+        for name, qc_op in sim.get_qc_quantize_op().items():
+            assert qc_op.encodings[0].bw == 8
+
+        for name, qc_op in sim.get_qc_quantize_op().items():
+            assert qc_op.quant_info.tensorQuantizerRef[0].isEncodingValid is True
+            assert qc_op.op_mode == OpMode.quantizeDequantize
+
+        sim.export('/tmp/', 'quant_sim_model')
+
+        with open('/tmp/quant_sim_model.encodings', 'rb') as json_file:
+            encoding_data = json.load(json_file)
+        activation_keys = list(encoding_data["activation_encodings"].keys())
+        assert activation_keys == ['2', 'input', 'output']
+        for act in activation_keys:
+            act_encodings_keys = list(encoding_data["activation_encodings"][act][0].keys())
+            assert act_encodings_keys == ['bitwidth', 'dtype', 'is_symmetric', 'max', 'min', 'offset', 'scale']
+
+        param_keys = list(encoding_data['param_encodings'].keys())
+        assert param_keys == ['gru_r_w', 'gru_w', 'lstm_r_w', 'lstm_w']
         for param in param_keys:
             param_encodings_keys = list(encoding_data["param_encodings"][param][0].keys())
             assert param_encodings_keys == ['bitwidth', 'dtype', 'is_symmetric', 'max', 'min', 'offset', 'scale']
@@ -540,14 +579,14 @@ class TestQuantSim:
                                    default_param_bw=8)
         sim.session.run(None, {'input': sample_input})
 
-
     def test_model_with_custom_ops(self):
         custom_ops_path = os.path.dirname(libquant_info.__file__)
         custom_ops_path = os.path.join(custom_ops_path, "customops")
         onnx_library = os.path.join(custom_ops_path, "libonnx_custom_add.so")
 
-        def callback(session, args):
-            pass
+        def dummy_callback(session, args):
+            calib_data = {'input': np.random.rand(1, 3, 64, 64).astype(np.float32)}
+            _ = session.run(None, calib_data)
 
         model = custom_add_model()
         sim = QuantizationSimModel(model=model,
@@ -557,8 +596,10 @@ class TestQuantSim:
                                   user_onnx_libs=[onnx_library])
         sim.save_model_graph("./quantized_custom_model")
 
-        def dummy_callback(session, args):
-            pass
-
         sim.compute_encodings(dummy_callback, None)
+
+        os.makedirs('./tmp', exist_ok=True)
         sim.export('./tmp/', 'custom_op_model')
+
+        if os.path.exists('./tmp'):
+            shutil.rmtree('./tmp')
