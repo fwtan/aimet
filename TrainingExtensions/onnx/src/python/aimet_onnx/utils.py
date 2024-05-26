@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -37,15 +37,14 @@
 """ Utility functions for ONNX """
 import itertools
 from typing import Dict, List, Union, Tuple
-
 import os
 import pickle
 import numpy as np
 import onnx
 from onnx import helper, numpy_helper, mapping
-from packaging import version
 
 from aimet_common.utils import AimetLogger
+from packaging import version
 
 # pylint: disable=no-name-in-module, ungrouped-imports
 if version.parse(onnx.__version__) >= version.parse("1.14.0"):
@@ -57,7 +56,7 @@ logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 
 
 OP_TYPES_WITH_PARAMS = ['Conv', 'Gemm', 'ConvTranspose', 'BatchNormalization', 'MatMul', 'Transpose',
-                        'InstanceNormalization']
+                        'InstanceNormalization', 'RNN', 'LSTM', 'GRU']
 
 
 def remove_nodes_with_type(node_type: str, onnx_graph: onnx.GraphProto):
@@ -203,6 +202,8 @@ def make_dummy_input(model: ModelProto, dynamic_size: int = 1) -> Dict[str, np.n
                 shape.append(dim.dim_value)
         if shape:
             input_dict[name] = np.random.randn(*shape).astype(mapping.TENSOR_TYPE_TO_NP_TYPE[dtype])
+        else:
+            input_dict[name] = np.array(np.random.randn(*shape)).astype(mapping.TENSOR_TYPE_TO_NP_TYPE[dtype])
     return input_dict
 
 
@@ -297,7 +298,7 @@ def get_graph_intermediate_activations(graph: GraphProto) -> List[str]:
     activation_names = []
     for node in graph.node:
         for name in node.input:
-            if name not in activation_names and name not in param_names:
+            if name not in activation_names and name not in param_names and name:
                 activation_names.append(name)
     return activation_names
 
@@ -318,9 +319,9 @@ class ParamUtils:
                 for param in model.graph.initializer:
                     if param.name == param_name:
                         return param.dims
-            assert "Param not present in the node"
+            logger.debug("Param not present in the node")
         else:
-            assert "Node type not in allowed op types with param list"
+            logger.debug("Node type not in allowed op types with param list")
         return None
 
     @staticmethod

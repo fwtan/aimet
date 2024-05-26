@@ -39,12 +39,14 @@ import copy
 from abc import abstractmethod
 from typing import Dict, List, Tuple, Set, Union
 import torch
+from torch.nn.modules import ConvTranspose2d
 
 from aimet_common.utils import AimetLogger, log_with_error_and_assert_if_false
 from aimet_common.graph_searcher import GraphSearcher
 from aimet_common.graph_pattern_matcher import PatternType
 from aimet_common.connected_graph.operation import Op
 from aimet_common.defs import QuantizationDataType, QuantDtypeBwInfo
+from aimet_common.connected_graph.connectedgraph_utils import CG_SPLIT
 from aimet_common.connected_graph import connectedgraph_utils as cg_utils
 from aimet_common.quantsim_config.json_config_importer import ConfigDictKeys, ConfigType, SupergroupType, OpType, \
     ParamType, DefaultsType, OpTypeType, ConfigDictType
@@ -56,7 +58,7 @@ from aimet_torch.tensor_quantizer import TensorQuantizer
 from aimet_torch.meta.connectedgraph import ConnectedGraph
 from aimet_torch.onnx_utils import map_torch_types_to_onnx, pytorch_functional_name_to_onnx_dict
 from aimet_torch.translation_mapping import aimet_op_to_backend_op_name_map
-from aimet_torch.experimental.v2.quantization.wrappers.builder import LazyQuantizeWrapper
+from aimet_torch.v2.quantization.builder import LazyQuantizeWrapper
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 MAP_PYTORCH_PARAM_NAME_TO_QUANTSIM_NAME = {
@@ -198,7 +200,7 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
                                 self._module_to_quantsim_wrapper_dict:
                             qc_quantize_wrapper = self._module_to_quantsim_wrapper_dict[input_op.get_module()]
                             tensor_quantizers_for_input_true.append(qc_quantize_wrapper.output_quantizers[0])
-                        elif input_op.type == 'Split':
+                        elif input_op.type == CG_SPLIT:
                             queue.append(input_op)
         return tensor_quantizers_for_input_true
 
@@ -219,13 +221,13 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
             while queue:
                 current_op = queue.pop()
                 if current_op.output:
-                    output_ops = [consumer for consumer in current_op.output.consumers]
+                    output_ops = [consumer for consumer in current_op.output.consumers]  # pylint: disable=unnecessary-comprehension
                     for output_op in output_ops:
                         if output_op.get_module() is not None and output_op.get_module() in \
                                 self._module_to_quantsim_wrapper_dict:
                             qc_quantize_wrapper = self._module_to_quantsim_wrapper_dict[output_op.get_module()]
                             tensor_quantizers_for_output_true += qc_quantize_wrapper.input_quantizers
-                        elif output_op.type == 'Split':
+                        elif output_op.type == CG_SPLIT:
                             queue.append(output_op)
         return tensor_quantizers_for_output_true
 
@@ -238,9 +240,9 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
         quantization disabled.
         """
         tensor_quantizers_for_input_false = []
-        neighboring_input_ops = get_all_ops_in_neighborhood(op, 'input')
+        neighboring_input_ops = get_all_ops_in_neighborhood(op, 'input', split_type=CG_SPLIT)
         for input_op in neighboring_input_ops:
-            if input_op.type != 'Split' and input_op.get_module() is not None and input_op.get_module() in \
+            if input_op.type != CG_SPLIT and input_op.get_module() is not None and input_op.get_module() in \
                     self._module_to_quantsim_wrapper_dict:
                 qc_quantize_wrapper = self._module_to_quantsim_wrapper_dict[input_op.get_module()]
                 if neighboring_input_ops[input_op] == 'input':
@@ -258,9 +260,9 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
         quantization disabled.
         """
         tensor_quantizers_for_output_false = []
-        neighboring_output_ops = get_all_ops_in_neighborhood(op, 'output')
+        neighboring_output_ops = get_all_ops_in_neighborhood(op, 'output', split_type=CG_SPLIT)
         for output_op in neighboring_output_ops:
-            if output_op.type != 'Split' and output_op.get_module() is not None and output_op.get_module() in \
+            if output_op.type != CG_SPLIT and output_op.get_module() is not None and output_op.get_module() in \
                     self._module_to_quantsim_wrapper_dict:
                 qc_quantize_wrapper = self._module_to_quantsim_wrapper_dict[output_op.get_module()]
                 if neighboring_output_ops[output_op] == 'input':
@@ -485,7 +487,6 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
             conv_bn_pairs = []
 
             def handler(_, op_list):
-                from torch.nn.modules import ConvTranspose2d
                 conv, bn = op_list
                 conv_module = conv.get_module()
                 # Transposed depthwise convolutions are not supported for batchnorm folding

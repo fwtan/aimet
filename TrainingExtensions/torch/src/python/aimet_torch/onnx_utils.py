@@ -52,7 +52,7 @@ import torchvision
 import onnx
 import onnxsim
 import yaml
-from packaging import version
+from packaging import version  # pylint: disable=wrong-import-order
 
 from aimet_common.utils import AimetLogger
 import aimet_torch.utils
@@ -302,7 +302,7 @@ class CustomMarker(torch.nn.Module):
     """
 
     def __init__(self, module, identifier, is_leaf):
-        super(CustomMarker, self).__init__()
+        super().__init__()
         self.marked_module = module
         self.identifier = identifier
         self.is_leaf = is_leaf
@@ -466,6 +466,7 @@ class OnnxSaver:
         :param onnx_model: ONNX model object
         :param pytorch_model: Equivalent PyTorch model instance
         """
+        # pylint: disable=consider-using-generator
         root_module_names = tuple([local_module_name for local_module_name, _ in pytorch_model.named_children()])
         node_names = [node.name  for node in onnx_model.graph.node if not node.name.startswith('Constant')]
         num_nodes = len(node_names)
@@ -1554,6 +1555,14 @@ def restore_onnx_graph_initializers(model: onnx.ModelProto,
                 onnx_graph, input_tensor, pruned_initializer_map
             )
 
+    # Remove all the detached "Identity" type nodes
+    for pruned_initializer_info in pruned_initializer_map.values():
+        onnx_graph.node.remove(pruned_initializer_info.identity_node)
+        _logger.debug(
+            "Added new Initializer `%s` and removing existing Identity node `%s`",
+            pruned_initializer_info.initializer.name,
+            pruned_initializer_info.identity_node.name,
+        )
     return model
 
 
@@ -1585,7 +1594,7 @@ def _restore_pruned_initializer(onnx_graph: onnx.GraphProto,
                                 pruned_initializer_map: Dict[str, PrunedInitializerInfo],
                                 new_initializer_name: Optional[str] = None):
     """
-    Create new Initializer and remove Identity node to restore pruned Initializer
+    Create new Initializer to restore pruned Initializer
 
     :param onnx_graph: ONNX graph
     :param input_tensor: Input tensor name
@@ -1594,13 +1603,5 @@ def _restore_pruned_initializer(onnx_graph: onnx.GraphProto,
     """
     if result := pruned_initializer_map.get(input_tensor):
         new_initializer = result.initializer
-        existing_identity_node = result.identity_node
-
         new_initializer.name = new_initializer_name or input_tensor
         onnx_graph.initializer.append(new_initializer)
-        onnx_graph.node.remove(existing_identity_node)
-        _logger.info(
-            "Added new Initializer `%s` and removed existing Identity node `%s`",
-            new_initializer.name,
-            existing_identity_node.name,
-        )

@@ -19,7 +19,7 @@ This page provides instructions to build, install and use the AIMET software in 
 ## Requirements
 The AIMET package requires the following host platform setup:
 - 64-bit Intel x86-compatible processor
-- Linux Ubuntu: 20.04 LTS
+- Linux Ubuntu: 22.04 LTS
 - bash command shell
 - For GPU variants:
   - Nvidia GPU card (Compute capability 5.2 or later)
@@ -49,7 +49,7 @@ Clone the google test repo as follows:
 cd aimet
 mkdir -p ./ThirdParty/googletest
 pushd ./ThirdParty/googletest
-git clone https://github.com/google/googletest.git -b release-1.8.0 googletest-release-1.8.0
+git clone https://github.com/google/googletest.git -b release-1.12.1  googletest-release-1.12.1
 popd
 ```
 
@@ -118,8 +118,10 @@ Code may *optionally* be developed inside a development docker container. This s
 
 ### Set variant
 Set the `<variant_string>` to ONE of the following depending on your desired variant
-- For the PyTorch 1.13 GPU variant, use `"torch-gpu"`
-- For the PyTorch 1.13 CPU variant, use `"torch-cpu"`
+- For the PyTorch 2.1 GPU variant, use `"torch-gpu"`
+- For the PyTorch 2.1 CPU variant, use `"torch-cpu"`
+- For the PyTorch 1.13 GPU variant, use `"torch-gpu-pt113"`
+- For the PyTorch 1.13 CPU variant, use `"torch-cpu-pt113"`
 - For the TensorFlow GPU variant, use `"tf-gpu"`
 - For the TensorFlow CPU variant, use `"tf-cpu"`
 - For the ONNX GPU variant, use `"onnx-gpu"`

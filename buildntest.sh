@@ -155,13 +155,13 @@ if [ ! -d "../aimet" ] && [ ! -d "../aimet-main" ]; then
 fi
 
 # Set the docker file path
-# This is the default value (for python 3.8 docker files)
+# This is the default value (for python 3.10 docker files)
 dockerfile_path=${scriptPath}/Jenkins
 if [ -n "$PYTHON_VER" ]; then
     # If the python version variable was set, then switch the path
-    if [ "${PYTHON_VER}" != "3.8" ]; then
-        # We only support python 3.8 version.
-        echo "ERROR: Invalid PYTHON_VER (${PYTHON_VER}). Must be either 3.8!"
+    if [ "${PYTHON_VER}" != "3.10" ]; then
+        # We only support python 3.10 version.
+        echo "ERROR: Invalid PYTHON_VER (${PYTHON_VER}). Must be either 3.10!"
         exit 3
     fi
 fi
@@ -277,10 +277,19 @@ else
     exit 3
 fi
 
+# Mirror URL prefix for github repos (if one exists)
+additional_opts="-v /etc/passwd:/etc/passwd:ro "
+if [ -n "${GITHUB_MIRROR_URL}" ]; then
+   USER_ENV_VARS+=("GITHUB_MIRROR_URL")
+   echo "git-user:x:$(id -u):$(id -g):Git User:/tmp:/bin/bash" > /tmp/fake_passwd
+   additional_opts=" -w /tmp -v /usr2/${USER}/.ssh:/tmp/.ssh -v /tmp/fake_passwd:/etc/passwd:ro "
+fi
+
 echo -e "Starting docker container${loading_symbol} \n"
 DOCKER_RUN_CMD="${DOCKER_RUN_PREFIX} --rm --name=$docker_container_name -e DISPLAY=:0 \
 				-u $(id -u ${USER}):$(id -g ${USER}) \
-				-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+				${additional_opts} \
+				-v /etc/group:/etc/group:ro \
 				-v /tmp/.X11-unix:/tmp/.X11-unix \
 				-v ${workspaceFolder}:${workspaceFolder} \
 				-v ${outputRootFolder}:${outputRootFolder} \

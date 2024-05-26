@@ -50,6 +50,7 @@ from onnxruntime import SessionOptions, GraphOptimizationLevel, InferenceSession
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
 from packaging import version
 
+# pylint: disable=wrong-import-order
 from aimet_common import libpymo
 from aimet_common import libquant_info
 from aimet_common.defs import QuantScheme, QuantizationDataType
@@ -110,9 +111,7 @@ class EncodingMismatchInfo:
 class QuantizationSimModel:
     """ Creates a QuantizationSimModel model by adding quantization simulations ops to a given model """
 
-    # pylint: disable=too-many-arguments
-    # pylint: disable=too-many-locals
-    # pylint: disable=too-many-instance-attributes
+    # pylint: disable=too-many-arguments, too-many-locals, too-many-instance-attributes
     def __init__(self,
                  model: ModelProto,
                  dummy_input: Dict[str, np.ndarray] = None,
@@ -141,14 +140,18 @@ class QuantizationSimModel:
                                  Note that the mode default_data_type=QuantizationDataType.float is only supported with
                                  default_output_bw=16 and default_param_bw=16
         :param simplify_model: Default True, uses onnx simplifier to simplify model
-        :param: user_onnx_libs: List of paths to all compiled ONNX custom ops libraries
+        :param user_onnx_libs: List of paths to all compiled ONNX custom ops libraries
         """
         self.model = model
         if not isinstance(model, ONNXModel):
             self.model = ONNXModel(model)
 
         if simplify_model:
-            self.model.model, _ = simplify(self.model.model)
+            try:
+                self.model.model, _ = simplify(self.model.model)
+            # pylint: disable=bare-except
+            except:
+                logger.info('ONNX Simplifier failed. Proceeding with unsimplified model.')
 
         if not dummy_input:
             dummy_input = make_dummy_input(self.model.model)

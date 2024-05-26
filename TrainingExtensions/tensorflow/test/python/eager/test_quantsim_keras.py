@@ -47,18 +47,22 @@ from aimet_common.libpymo import TfEncoding
 from packaging import version
 from tensorflow import keras
 
+import aimet_common.utils
 from aimet_common.defs import QuantScheme, RANGE_LEARNING_SCHEMES
 from aimet_tensorflow.examples.test_models import keras_model
 from aimet_tensorflow.keras.utils.quantizer_utils import SaveModelWithoutQuantsimWrappersCallback
 from aimet_tensorflow.keras.cross_layer_equalization import equalize_model
 from aimet_tensorflow.keras.quant_sim.qc_mha_wrapper import QcQuantizableMultiHeadAttention
 from aimet_tensorflow.keras.quantsim import QuantizationSimModel
+from aimet_tensorflow.keras.rnn.qc_quant_LSTM import QuantizedLSTM
 from test_models_keras import tiny_conv_net
+
 
 def conv_functional():
     input_shape = (128, 28, 28, 1)
     inp = tf.keras.Input(shape=input_shape[1:])
-    x = tf.keras.layers.Conv2D(32, kernel_size=(3, 3), activation="relu")(inp)
+    x = tf.keras.layers.Conv2D(32, kernel_size=(3, 3))(inp)
+    x = tf.keras.layers.ReLU()(x)
     x = tf.keras.layers.Conv2DTranspose(32, kernel_size=(3, 3), activation="relu")(x)
     x = tf.keras.layers.DepthwiseConv2D(depth_multiplier=1, kernel_size=(3, 3), activation='relu')(x)
     x = tf.keras.layers.Flatten()(x)
@@ -68,12 +72,14 @@ def conv_functional():
     model = tf.keras.Model(inputs=inp, outputs=x, name='conv_functional')
     return model
 
+
 def dense_functional():
     inp = tf.keras.layers.Input(shape=(5,))
     x = tf.keras.layers.Dense(units=2)(inp)
     x = tf.keras.layers.Softmax()(x)
     model = tf.keras.Model(inputs=inp, outputs=x, name="dense_functional")
     return model
+
 
 def dense_sequential():
     model = tf.keras.Sequential()
@@ -102,6 +108,7 @@ class DenseSubclassing(tf.keras.Model):
         x = self.softmax(x)
         return x
 
+
 def model_with_lambda_operators():
     inp = tf.keras.layers.Input(shape=(5,))
     inp_2 = tf.keras.layers.Input(shape=(3,))
@@ -119,8 +126,8 @@ def model_with_tf_op_lambda_operators_multi_tf_keras_input():
     input_layer = tf.keras.Input(batch_input_shape=(1, 16, 32, 3))
     x1 = tf.keras.layers.Dense(4, activation=tf.nn.relu)(input_layer)
     x2 = tf.transpose(x1, perm=[0, 1, 3, 2])
-    output = tf.matmul(x1, x2)
-
+    x = tf.matmul(x1, x2)
+    output = tf.image.resize(x, [tf.shape(input_layer)[1], tf.shape(input_layer)[2]])
     return tf.keras.Model(
         inputs=input_layer,
         outputs=output,
@@ -143,6 +150,7 @@ def model_with_tf_op_lambda_operators_multi_tf_static_inputs():
         name="model_with_tf_op_lambda_operators_multi_tf_static_inputs"
     )
 
+
 def model_with_reused_layer():
     relu = tf.keras.layers.ReLU()
     inp = tf.keras.layers.Input(shape=(5,))
@@ -152,6 +160,7 @@ def model_with_reused_layer():
     x = tf.keras.layers.Softmax()(x)
     model = tf.keras.Model(inputs=inp, outputs=x, name="model_with_reused_layer")
     return model
+
 
 class DenseReluLayer(tf.keras.layers.Layer):
     def __init__(self, **kwargs):
@@ -163,6 +172,7 @@ class DenseReluLayer(tf.keras.layers.Layer):
         x = self.dense(inputs)
         x = self.relu(x)
         return x
+
 
 def test_quantsim_basic():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
@@ -205,12 +215,14 @@ def test_quantsim_basic():
 
         qsim.export('./data', 'test_export')
 
+
 def test_quantsim_export_quantizer_args():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
         model = dense_functional()
         rand_inp = np.random.randn(100, 5)
 
-        qsim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, default_param_bw=16, default_output_bw=16 )
+        qsim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced, default_param_bw=16,
+                                    default_output_bw=16)
 
         qsim.export('./data', 'test_export_with_quant_args')
 
@@ -225,6 +237,7 @@ def test_quantsim_export_quantizer_args():
         assert quantizer_args["quant_scheme"] == QuantScheme.post_training_tf_enhanced.name
         assert quantizer_args["dtype"] == "int"
         assert quantizer_args["is_symmetric"]
+
 
 def test_quantsim_with_custom_config_file():
     quantsim_config = {
@@ -425,12 +438,13 @@ def test_model_with_tf_op_lambda_operators_multi_tf_keras_input():
             encodings = json.load(encodings_file)
 
         assert "transpose" in qsim.model.layers[2].original_layer.name, "This QCQuantizeWrapper should wrap the `tf.transpose` TF Op Lambda Layer"
-        assert "matmul" in qsim.model.layers[3].original_layer.name, "This QCQuantizeWrapper should house the `tf.matmul` TF Op Lambda Layer"
+        assert "matmul" in qsim.model.layers[5].original_layer.name, "This QCQuantizeWrapper should house the `tf.matmul` TF Op Lambda Layer"
+        assert "image.resize" in qsim.model.layers[8].original_layer.name, "This QCQuantizeWrapper should house the `tf.image.resize` TF Op Lambda Layer"
 
         assert len(qsim.model.layers[2].input_quantizers) == 1, "tf.transpose should have only 1 input_quantizer"
-        assert len(qsim.model.layers[3].input_quantizers) == 2, "tf.matmul should have 2 input_quantizer for a @ b"
-
-        assert len(encodings['activation_encodings']) == 4
+        assert len(qsim.model.layers[5].input_quantizers) == 2, "tf.matmul should have 2 input_quantizer for a @ b"
+        assert len(qsim.model.layers[8].input_quantizers) == 3, "tf.image.resize should have 3 input_quantizers for input, and the tensors for the new height and width for tf.shape"
+        assert len(encodings['activation_encodings']) == 5
         assert len(encodings['param_encodings']) == 1, "Only the Dense layer in this model should have param_encoding"
 
 
@@ -463,50 +477,57 @@ def test_model_with_tf_op_lambda_operators_multi_tf_static_inputs():
 
 def test_qat():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
-        model = dense_functional()
-        rand_inp = np.random.randn(10, 5)
-        rand_out = np.random.randn(10, 2)
-        qsim = QuantizationSimModel(model, quant_scheme='tf', default_param_bw=8, default_output_bw=8)
-        qsim.compute_encodings(lambda m, _: m.predict(rand_inp), None)
-        qsim.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                           loss=tf.keras.losses.MeanSquaredError())
-        # Track weights for dense layer to check that they are updated during fit
-        running_weights = [tf.keras.backend.get_value(param) for
-                              param in qsim.model.layers[1]._layer_to_wrap.weights]
-        # Track encoding max for dense output quantizer to check that it is not updated during fit
-        running_dense_output_quantizer_encoding_max = \
-            tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            epochs = 10
-            save_model_callback = SaveModelWithoutQuantsimWrappersCallback(qsim, tmp_dir, "test_qat")
-            for i in range(epochs):
-                _ = qsim.model.fit(x=rand_inp, y=rand_out, batch_size=1, callbacks=save_model_callback)
-                ending_weights = [tf.keras.backend.get_value(param) for
-                                  param in qsim.model.layers[1]._layer_to_wrap.weights]
-                new_dense_output_quantizer_encoding_max = \
-                    tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
-                for idx, weight in enumerate(running_weights):
-                    assert not np.array_equal(weight, ending_weights[idx])
-                assert np.array_equal(new_dense_output_quantizer_encoding_max,
-                                      running_dense_output_quantizer_encoding_max)
-                running_weights = ending_weights
-                running_dense_output_quantizer_encoding_max = new_dense_output_quantizer_encoding_max
+        saved_flag = aimet_common.utils.SAVE_TO_YAML
+        aimet_common.utils.SAVE_TO_YAML = True
 
-            h5s = encodings = yamls = saved_models_folders = 0
-            for file in os.listdir(tmp_dir):
-                if file.endswith('h5'):
-                    h5s += 1
-                elif file.endswith('encodings'):
-                    encodings += 1
-                elif file.endswith('yaml'):
-                    yamls += 1
-                else:
-                    saved_models_folders += 1
+        try:
+            model = dense_functional()
+            rand_inp = np.random.randn(10, 5)
+            rand_out = np.random.randn(10, 2)
+            qsim = QuantizationSimModel(model, quant_scheme='tf', default_param_bw=8, default_output_bw=8)
+            qsim.compute_encodings(lambda m, _: m.predict(rand_inp), None)
+            qsim.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+                               loss=tf.keras.losses.MeanSquaredError())
+            # Track weights for dense layer to check that they are updated during fit
+            running_weights = [tf.keras.backend.get_value(param) for
+                               param in qsim.model.layers[1]._layer_to_wrap.weights]
+            # Track encoding max for dense output quantizer to check that it is not updated during fit
+            running_dense_output_quantizer_encoding_max = \
+                tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
 
-            for file_count in [h5s, encodings, yamls, saved_models_folders]:
-                assert file_count == 1, f"QAT Save Callback did not work"
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                epochs = 10
+                save_model_callback = SaveModelWithoutQuantsimWrappersCallback(qsim, tmp_dir, "test_qat")
+                for i in range(epochs):
+                    _ = qsim.model.fit(x=rand_inp, y=rand_out, batch_size=1, callbacks=save_model_callback)
+                    ending_weights = [tf.keras.backend.get_value(param) for
+                                      param in qsim.model.layers[1]._layer_to_wrap.weights]
+                    new_dense_output_quantizer_encoding_max = \
+                        tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
+                    for idx, weight in enumerate(running_weights):
+                        assert not np.array_equal(weight, ending_weights[idx])
+                    assert np.array_equal(new_dense_output_quantizer_encoding_max,
+                                          running_dense_output_quantizer_encoding_max)
+                    running_weights = ending_weights
+                    running_dense_output_quantizer_encoding_max = new_dense_output_quantizer_encoding_max
 
+                h5s = encodings = yamls = saved_models_folders = 0
+                for file in os.listdir(tmp_dir):
+                    if file.endswith('h5'):
+                        h5s += 1
+                    elif file.endswith('encodings'):
+                        encodings += 1
+                    elif file.endswith('yaml'):
+                        yamls += 1
+                    else:
+                        saved_models_folders += 1
+
+                for file_count in [h5s, encodings, yamls, saved_models_folders]:
+                    assert file_count == 1, f"QAT Save Callback did not work"
+
+        finally:
+            aimet_common.utils.SAVE_TO_YAML = saved_flag
 
 def test_range_learning():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
@@ -724,6 +745,7 @@ def test_quantizable_mha_with_mask():
     # check that QcQuantizableMultiHeadAttention exists in QuantSim model.layers
     assert any(isinstance(layer, QcQuantizableMultiHeadAttention) for layer in quantized_model.model.layers)
 
+
 def test_quantizable_mha_encodings():
     B = 5
     T = 8
@@ -761,6 +783,7 @@ def test_quantizable_mha_encodings():
     assert all((quantized_model_tensor >= output_encoding_min - FLOAT_DELTA) &
                (quantized_model_tensor <= output_encoding_max + FLOAT_DELTA))
 
+
 def test_quantizable_mha_export_encodings():
     B = 5
     T = 8
@@ -786,10 +809,16 @@ def test_quantizable_mha_export_encodings():
         encodings = json.load(encodings_file)
 
     for wrapper in stage_3_model.model.layers[2]._wrapped_layers:
-        for io_quantizer in wrapper.input_quantizers + wrapper.output_quantizers:
-            if io_quantizer.encoding is not None:
-                tensor_name = "multi_head_attention/" + wrapper.name + "/" + io_quantizer.name
-                encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(io_quantizer)
+        for i_quantizer in wrapper.input_quantizers:
+            if i_quantizer.encoding is not None:
+                tensor_name = wrapper.name + "/" + i_quantizer.name + ":0"
+                encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(i_quantizer)
+                assert tensor_name in encodings['activation_encodings']
+                assert encodings['activation_encodings'][tensor_name] == encoding_dict
+        for o_quantizer in wrapper.output_quantizers:
+            if o_quantizer.encoding is not None:
+                tensor_name = wrapper.name + ":0"
+                encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(o_quantizer)
                 assert tensor_name in encodings['activation_encodings']
                 assert encodings['activation_encodings'][tensor_name] == encoding_dict
         for idx, param_quantizer in enumerate(wrapper.param_quantizers):
@@ -798,6 +827,7 @@ def test_quantizable_mha_export_encodings():
                 encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(param_quantizer)
                 assert param_name in encodings['param_encodings']
                 assert encodings['param_encodings'][param_name] == encoding_dict
+
 
 def _common_stays_valid_after_export_helper(model, rand_inp, config=None):
     tf.keras.backend.clear_session()
@@ -844,7 +874,7 @@ def _common_stays_valid_after_export_helper(model, rand_inp, config=None):
         if not isinstance(original_quantizer.tensor_quantizer, List):
             original_quantizer_tensor_quantizers = [original_quantizer.tensor_quantizer]
             new_quantizer_tensor_quantizers = [new_quantizer.tensor_quantizer]
-        else: 
+        else:
             original_quantizer_tensor_quantizers = original_quantizer.tensor_quantizer
             new_quantizer_tensor_quantizers = new_quantizer.tensor_quantizer
 
@@ -874,27 +904,32 @@ def _common_stays_valid_after_export_helper(model, rand_inp, config=None):
         if isinstance(layer, tf.keras.layers.InputLayer):
             continue
 
-        assert len(layer.input_quantizers) == len(original_layer_and_quantizers[layer.name]["input_quantizers"]), f"Not the same number of input quantizers for layer {layer.name}"
+        assert len(layer.input_quantizers) == len(original_layer_and_quantizers[layer.name][
+                                                      "input_quantizers"]), f"Not the same number of input quantizers for layer {layer.name}"
         for i, _ in enumerate(layer.input_quantizers):
             check_quantizers(original_layer_and_quantizers[layer.name]["input_quantizers"][i],
-                            layer.input_quantizers[i])
+                             layer.input_quantizers[i])
             check_encodings(original_layer_and_quantizers[layer.name]["input_quantizers"][i].encoding,
                             layer.input_quantizers[i].encoding)
-        assert len(layer.output_quantizers) == len(original_layer_and_quantizers[layer.name]["output_quantizers"]), f"Not the same number of output quantizers for layer {layer.name}"
+        assert len(layer.output_quantizers) == len(original_layer_and_quantizers[layer.name][
+                                                       "output_quantizers"]), f"Not the same number of output quantizers for layer {layer.name}"
         for i, _ in enumerate(layer.output_quantizers):
             check_quantizers(original_layer_and_quantizers[layer.name]["output_quantizers"][i],
-                            layer.output_quantizers[i])
+                             layer.output_quantizers[i])
             check_encodings(original_layer_and_quantizers[layer.name]["output_quantizers"][i].encoding,
                             layer.output_quantizers[i].encoding)
 
-        assert len(layer.param_quantizers) == len(original_layer_and_quantizers[layer.name]["param_quantizers"]), f"Not the same number of param quantizers for layer {layer.name}"
+        assert len(layer.param_quantizers) == len(original_layer_and_quantizers[layer.name][
+                                                      "param_quantizers"]), f"Not the same number of param quantizers for layer {layer.name}"
         for i, _ in enumerate(layer.param_quantizers):
             check_quantizers(original_layer_and_quantizers[layer.name]["param_quantizers"][i],
-                            layer.param_quantizers[i])
+                             layer.param_quantizers[i])
             check_encodings(original_layer_and_quantizers[layer.name]["param_quantizers"][i].encoding,
                             layer.param_quantizers[i].encoding)
 
-    np.testing.assert_array_equal(original_sim_output, sim.model.predict(rand_inp), err_msg="Model output changed after export")
+    np.testing.assert_array_equal(original_sim_output, sim.model.predict(rand_inp),
+                                  err_msg="Model output changed after export")
+
 
 def test_model_stays_valid_after_export_per_tensor():
     model = conv_functional()
@@ -997,7 +1032,7 @@ def test_load_encodings():
 
     # For param
     expected_encoding = param_encodings['conv2d_1/kernel:0'][0]
-    actual_encoding   = extracted_encoding["param_encodings"]['conv2d_1/kernel:0'][0]
+    actual_encoding = extracted_encoding["param_encodings"]['conv2d_1/kernel:0'][0]
     assert actual_encoding.get('bitwidth') == expected_encoding.get('bitwidth')
     assert actual_encoding.get('offset') == expected_encoding.get('offset')
     assert actual_encoding.get('is_symmetric') == expected_encoding.get('is_symmetric')
@@ -1006,13 +1041,12 @@ def test_load_encodings():
 
     # For activation
     expected_encoding = activation_encodings["conv2d_1/Tanh:0"][0]
-    actual_encoding   = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
+    actual_encoding = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
     assert actual_encoding.get('bitwidth') == expected_encoding.get('bitwidth')
     assert actual_encoding.get('offset') == expected_encoding.get('offset')
     assert actual_encoding.get('is_symmetric') == expected_encoding.get('is_symmetric')
     assert np.allclose(actual_encoding.get('min'), expected_encoding.get('min'), atol=1e-5)
     assert np.allclose(actual_encoding.get('max'), expected_encoding.get('max'), atol=1e-5)
-
 
     # Delete encodings JSON file
     if os.path.exists("./dummy.encodings"):
@@ -1045,7 +1079,7 @@ def test_load_encodings_with_disabled_param():
 
     model = keras_model()
 
-    sim = QuantizationSimModel(model,config_file='./quantsim_config.json')
+    sim = QuantizationSimModel(model, config_file='./quantsim_config.json')
     param_encodings = {'conv2d_1/kernel:0': [{'bitwidth': 4, 'is_symmetric': "False",
                                               'max': 0.14584073424339294,
                                               'min': -0.12761062383651733,
@@ -1085,13 +1119,12 @@ def test_load_encodings_with_disabled_param():
 
     # For activation
     expected_encoding = activation_encodings["conv2d_1/Tanh:0"][0]
-    actual_encoding   = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
+    actual_encoding = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
     assert actual_encoding.get('bitwidth') == expected_encoding.get('bitwidth')
     assert actual_encoding.get('offset') == expected_encoding.get('offset')
     assert actual_encoding.get('is_symmetric') == expected_encoding.get('is_symmetric')
     assert np.allclose(actual_encoding.get('min'), expected_encoding.get('min'), atol=1e-5)
     assert np.allclose(actual_encoding.get('max'), expected_encoding.get('max'), atol=1e-5)
-
 
     # Delete encodings JSON file
     if os.path.exists("./dummy.encodings"):
@@ -1168,7 +1201,7 @@ def test_load_encodings_pcq():
 
     # For param
     expected_encoding = param_encodings['conv2d_1/kernel:0']
-    actual_encoding   = extracted_encoding["param_encodings"]['conv2d_1/kernel:0']
+    actual_encoding = extracted_encoding["param_encodings"]['conv2d_1/kernel:0']
     for i in range(4):
         assert actual_encoding[i].get('bitwidth') == expected_encoding[i].get('bitwidth')
         assert actual_encoding[i].get('offset') == expected_encoding[i].get('offset')
@@ -1178,17 +1211,17 @@ def test_load_encodings_pcq():
 
     # For activation
     expected_encoding = activation_encodings["conv2d_1/Tanh:0"][0]
-    actual_encoding   = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
+    actual_encoding = extracted_encoding["activation_encodings"]["conv2d_1/Tanh:0"][0]
     assert actual_encoding.get('bitwidth') == expected_encoding.get('bitwidth')
     assert actual_encoding.get('offset') == expected_encoding.get('offset')
     assert actual_encoding.get('is_symmetric') == expected_encoding.get('is_symmetric')
     assert np.allclose(actual_encoding.get('min'), expected_encoding.get('min'), atol=1e-5)
     assert np.allclose(actual_encoding.get('max'), expected_encoding.get('max'), atol=1e-5)
 
-
     # Delete encodings JSON file
     if os.path.exists("./dummy.encodings"):
         os.remove("./dummy.encodings")
+
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
@@ -1248,6 +1281,7 @@ def test_initialization_and_export_non_strict_symmetric(quant_scheme) -> None:
                 assert offset == -128
                 assert np.isclose(encoding_min, scale * offset, atol=1e-6)
                 assert np.isclose(encoding_max, encoding_min + scale * 255, atol=1e-6)
+
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
@@ -1338,6 +1372,7 @@ def test_initialization_and_export_non_strict_symmetric_per_channel(quant_scheme
                 assert np.isclose(encoding_min, scale * offset, atol=1e-6)
                 assert np.isclose(encoding_max, encoding_min + scale * 255, atol=1e-6)
 
+
 def test_quant_scheme_percentile():
     """
     This test case ensures that the quantization is working fine with percentile scheme
@@ -1346,7 +1381,8 @@ def test_quant_scheme_percentile():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
         model = dense_functional()
 
-        qsim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf, default_param_bw=16, default_output_bw=16 )
+        qsim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf, default_param_bw=16,
+                                    default_output_bw=16)
         _, _, output_quantizers = qsim._get_quantizer_list()
         with pytest.raises(RuntimeError):
             for quantizer in output_quantizers:
@@ -1366,12 +1402,11 @@ def test_quant_scheme_percentile_setting_using_str():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
         model = dense_functional()
 
-        qsim = QuantizationSimModel(model, quant_scheme="percentile", default_param_bw=16, default_output_bw=16 )
+        qsim = QuantizationSimModel(model, quant_scheme="percentile", default_param_bw=16, default_output_bw=16)
         inp_quatizer, paramater_quantizer, output_quantizers = qsim._get_quantizer_list()
 
         for quantizer in inp_quatizer + paramater_quantizer + output_quantizers:
             assert quantizer.quant_scheme == QuantScheme.post_training_percentile
-
 
 def test_multi_output_model():
     """
@@ -1411,3 +1446,127 @@ def test_multi_output_model():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         sim.export(tmp_dir, "multi_output_model")
+
+def test_quantsim_with_separable_conv():
+    """Tests Quantsim with seperable conv layer without model preparer """
+
+    tf.keras.backend.clear_session()
+    input_shape = (2, 3, 3, 2)
+    inp = tf.keras.layers.Input(shape=input_shape[1:])
+    test_inp = np.random.rand(*input_shape)
+
+    separable_conv = tf.keras.layers.SeparableConv2D(
+        2,
+        kernel_size=2,
+        depthwise_initializer=tf.initializers.Constant([5.0]),
+        bias_initializer=tf.initializers.Constant([5.0])
+    )(inp)
+    model = tf.keras.models.Model(inputs=[inp], outputs=[separable_conv])
+
+    _ = model(test_inp)
+
+    with pytest.raises(AssertionError) as exc_info:
+        sim = QuantizationSimModel(model, quant_scheme='tf_enhanced', rounding_mode='nearest',
+                                   default_output_bw=8, default_param_bw=8)
+
+    assert str(exc_info.value) == 'SeparableConv2D found in the model. Please run model preparer before calling ' \
+                                  'QuantizationSimModel'
+
+def test_quantizable_lstm_basic():
+    batch_size = 1
+    timesteps = 10
+    features = 16
+    units = 32
+
+    # STAGE 1 MODEL - Functional model created with layers.lstm
+    stage_1_inputs = keras.Input(shape=(timesteps, features))
+    stage_1_output = keras.layers.LSTM(units, unroll=True)(stage_1_inputs)
+    stage_1_model = keras.Model(inputs=stage_1_inputs, outputs=stage_1_output)
+    
+    # STAGE 2 MODEL - Sequential model created with layers.lstm
+    stage_2_model = keras.models.Sequential(
+        [
+            keras.layers.LSTM(units, input_shape=(timesteps, features), unroll=True),
+        ]
+    )
+
+    # STAGE 3 MODEL - Quantized model created through QuantSim functional original
+    stage_3_model = QuantizationSimModel(stage_1_model)
+    
+    # STAGE 4 MODEL - Quantized model created through QuantSim sequential original
+    stage_4_model = QuantizationSimModel(stage_2_model)
+
+    input_data = np.ones([batch_size, timesteps, features])
+
+    output_1_tensor = stage_1_model(input_data)
+    output_2_tensor = stage_2_model(input_data)
+    output_3_tensor = stage_3_model.model(input_data)
+    output_4_tensor = stage_4_model.model(input_data)
+
+    # check that all output tensors have the same shape
+    assert output_1_tensor.shape == output_3_tensor.shape
+    assert output_2_tensor.shape == output_4_tensor.shape
+
+    # check that QcQuantizableMultiHeadAttention does not exist in original model.layers
+    assert not any(isinstance(layer, QuantizedLSTM) for layer in stage_1_model.layers)
+    assert not any(isinstance(layer, QuantizedLSTM) for layer in stage_2_model.layers)
+
+    # check that QcQuantizableMultiHeadAttention exists in QuantSim model.layers
+    assert any(isinstance(layer, QuantizedLSTM) for layer in stage_3_model.model.layers)
+    assert any(isinstance(layer, QuantizedLSTM) for layer in stage_4_model.model.layers)
+
+def test_quantizable_lstm_export_encodings():
+    batch_size = 1
+    timesteps = 10
+    features = 16
+    units = 32
+
+    # STAGE 1 MODEL - Functional model created with layers.lstm
+    stage_1_inputs = keras.Input(shape=(timesteps, features))
+    stage_1_output = keras.layers.LSTM(units, unroll=True)(stage_1_inputs)
+    stage_1_model = keras.Model(inputs=stage_1_inputs, outputs=stage_1_output)
+    
+    # STAGE 2 MODEL - Sequential model created with layers.lstm
+    stage_2_model = keras.models.Sequential(
+        [
+            keras.layers.LSTM(units, input_shape=(timesteps, features), unroll=True),
+        ]
+    )
+
+    rng = np.random.default_rng(seed=42)
+    rn_input = rng.random([batch_size, timesteps, features])
+
+    # STAGE 3 MODEL - Quantized model created through QuantSim functional original
+    stage_3_model = QuantizationSimModel(stage_1_model)   
+
+    stage_3_model.compute_encodings(lambda m, _: m(rn_input), None)
+    stage_3_model.export('./data', 'lstm_functional')
+
+    # STAGE 4 MODEL - Quantized model created through QuantSim sequential original
+    stage_4_model = QuantizationSimModel(stage_2_model)
+   
+    stage_4_model.compute_encodings(lambda m, _: m(rn_input), None)
+    stage_4_model.export('./data', 'lstm_sequential')
+   
+    #Check QuantizationSimModel model created through originals
+    with open("./data/lstm_functional.encodings", "r") as encodings_file_functional, \
+        open("./data/lstm_sequential.encodings", "r") as encodings_file_sequential:
+        encodings_functional = json.load(encodings_file_functional)
+        encodings_sequential = json.load(encodings_file_sequential)
+
+    for (model_layer, encodings) in (stage_3_model.model.layers[1], encodings_functional), (stage_4_model.model.layers[0], encodings_sequential):
+        for wrapper in model_layer._wrapped_layers:
+            #LSTM input is passing through the wrapper as is. Output and input encoding will be same.
+            for o_quantizer in wrapper.output_quantizers:
+                if o_quantizer.encoding is not None:
+                    tensor_name = wrapper.name + ":0"
+                    encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(o_quantizer)
+                    assert tensor_name in encodings['activation_encodings']
+                    assert encodings['activation_encodings'][tensor_name] == encoding_dict
+            for idx, param_quantizer in enumerate(wrapper.param_quantizers):
+                if param_quantizer.encoding is not None:
+                    param_name = wrapper._layer_to_wrap.weights[idx].name
+                    encoding_dict = QuantizationSimModel._get_encoding_dict_for_quantizer(param_quantizer)
+                    assert param_name in encodings['param_encodings']
+                    assert encodings['param_encodings'][param_name] == encoding_dict
+

@@ -35,6 +35,7 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 """ Quantsim for Keras """
+from __future__ import annotations
 
 from dataclasses import dataclass
 import json
@@ -51,6 +52,7 @@ from aimet_tensorflow.keras.connectedgraph import ConnectedGraph
 from aimet_tensorflow.keras.graphsearchtuils import GraphSearchUtils
 from aimet_tensorflow.keras.quant_sim.qc_quantize_wrapper import QcQuantizeWrapper, QuantizerSettings
 from aimet_tensorflow.keras.quant_sim.qc_mha_wrapper import QcQuantizableMultiHeadAttention
+from aimet_tensorflow.keras.rnn.qc_quant_LSTM import QuantizedLSTM
 from aimet_tensorflow.keras.quant_sim.tensor_quantizer import TensorQuantizer, ActivationTensorQuantizer, \
     ParamPerTensorQuantizer, StaticGridPerChannelQuantizer, ParamPerChannelQuantizer
 from aimet_tensorflow.keras.quantsim_config.quantsim_config import QuantSimConfigurator, INPUT_QUANTIZERS, \
@@ -64,8 +66,10 @@ _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
 unquantizable_modules = (tf.keras.layers.InputLayer, QcQuantizeWrapper)
 substitutable_modules = {
-    tf.keras.layers.MultiHeadAttention: QcQuantizableMultiHeadAttention
+    tf.keras.layers.MultiHeadAttention: QcQuantizableMultiHeadAttention,
+    tf.keras.layers.LSTM: QuantizedLSTM
 }
+
 
 @dataclass
 class QuantizationSimModelParams:
@@ -79,6 +83,7 @@ class QuantizationSimModelParams:
     in_place: bool = False
     config_file: str = None
     default_data_type: QuantizationDataType = QuantizationDataType.int
+
 
 # pylint: disable=too-many-ancestors
 # pylint: disable=too-many-instance-attributes
@@ -108,7 +113,7 @@ class QuantizationSimModel(tf.keras.Model):
                                  Note that the mode default_data_type=QuantizationDataType.float is only supported with
                                  default_output_bw=16 and default_param_bw=16
         """
-        super(QuantizationSimModel, self).__init__()
+        super().__init__()
 
         self._model_without_wrappers = model
         if not in_place:
@@ -116,7 +121,7 @@ class QuantizationSimModel(tf.keras.Model):
             n_weights = len(self._model_without_wrappers.weights)
             self._model_without_wrappers.set_weights(model.get_weights()[:n_weights])
         self._layer_name_to_quant_wrapper = {}
-        self._substituted_layer = {}    # to hold the substituted layers
+        self._substituted_layer = {}  # to hold the substituted layers
         self._validate_model()
         self.connected_graph = ConnectedGraph(self._model_without_wrappers)
         self._quantsim_configurator = self._initialize_quantsim_configurator(quant_scheme, rounding_mode,
@@ -148,6 +153,28 @@ class QuantizationSimModel(tf.keras.Model):
                          f'Layers with multiple inbound nodes: {multiple_inbound_node_layers}')
             _logger.error(error_msg)
             raise NotImplementedError(error_msg)
+
+        sep_conv_found = self.check_separable_conv(self._model_without_wrappers)
+        if sep_conv_found:
+            # Raising an assertion error incase there's SeparableConv2D in the model because in this case we have two sets of weights: Depthwise
+            # and Pointwise. For depthwise kernels, LAST TWO AXIS should be considered and for pointwise kernels LAST AXIS
+            # should be considered, which is not handled here. Running model preparer beforehand will resolve this as there the
+            # SeparableConv2D is splitted into two layers Depthwise and Pointwise seperately.
+            raise AssertionError("SeparableConv2D found in the model. Please run model preparer before calling QuantizationSimModel")
+
+    def check_separable_conv(self, model: tf.keras.models.Model | tf.keras.Sequential) -> bool:
+        """
+        Checks for SeparableConv2D layer in the model
+        :param model: Keras Model
+        :return: Boolean value, True if SeperableConv layer is found else False
+        """
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Sequential):
+                if self.check_separable_conv(layer):
+                    return True
+            elif isinstance(layer, tf.keras.layers.SeparableConv2D):
+                return True
+        return False
 
     def _get_quantizer_list(self) -> Tuple[List, List, List]:
         """
@@ -220,15 +247,24 @@ class QuantizationSimModel(tf.keras.Model):
             :param layer: Layer to wrap
             :return: Wrapped layer, or original layer if layer is not to be wrapped
             """
-            activation_quant_settings = QuantizerSettings(default_output_bw, default_data_type, rounding_mode,
-                                                          quant_scheme, False, False, False)
-            param_quant_settings = QuantizerSettings(default_param_bw, default_data_type, rounding_mode,
-                                                     quant_scheme, False, False, False)
-
             if isinstance(layer, tuple(substitutable_modules.keys())):
                 new_class = substitutable_modules[type(layer)]
                 config = layer.get_config()
                 config["copy_source_weights"] = layer.get_weights()
+
+                if isinstance(layer, tf.keras.layers.LSTM):
+                    if isinstance(self._model_without_wrappers, tf.keras.Sequential):
+                        config["is_sequential_model"] = True
+
+                    # pylint: disable=protected-access
+                    if self._quantsim_configurator._layer_to_config_dict[layer]["is_input_quantized"]["setting"]:
+                        config["is_input_quantized"] = True
+                    config["quant_scheme"] = quant_scheme
+                    config["rounding_mode"] = rounding_mode
+                    config["default_output_bw"] = default_output_bw
+                    config["default_param_bw"] = default_param_bw
+                    config["default_data_type"] = default_data_type
+
                 wrapped_layer = new_class.from_config(config)
                 self._substituted_layer[layer] = wrapped_layer
                 return wrapped_layer
@@ -238,6 +274,11 @@ class QuantizationSimModel(tf.keras.Model):
 
             if isinstance(layer, unquantizable_modules) or layer.submodules:
                 return layer
+
+            activation_quant_settings = QuantizerSettings(default_output_bw, default_data_type, rounding_mode,
+                                                          quant_scheme, False, False, False)
+            param_quant_settings = QuantizerSettings(default_param_bw, default_data_type, rounding_mode,
+                                                     quant_scheme, False, False, False)
 
             input_quantizers, output_quantizers, param_quantizers = self._get_quantizers_by_layer(layer)
             wrapper = QcQuantizeWrapper(layer, activation_quant_settings, param_quant_settings,
@@ -348,7 +389,8 @@ class QuantizationSimModel(tf.keras.Model):
         Get encodings dict containing all activation and parameter encodings info in the model
         :return: Dictionary containing all activation and parameter encodings info in the model
         """
-        # pylint: disable=protected-access
+        # pylint: disable=protected-access, too-many-branches
+        model_input_tensor_names = [inp.name for inp in self.model.inputs]
         activation_encodings = {}
         param_encodings = {}
         for wrapper in self.quant_wrappers():
@@ -357,10 +399,12 @@ class QuantizationSimModel(tf.keras.Model):
                     # because dense layers in quantizable MHA are not explicitly sublayers, they don't have their
                     # inbound_nodes parameter populated, so the name of the quantizer is used instead
                     if not wrapper._layer_to_wrap.inbound_nodes:
-                        tensor_name = "multi_head_attention/" + wrapper.name + "/" + input_quantizer.name
+                        tensor_name = wrapper.name + "/" + input_quantizer.name + ":0"
                     else:
                         tensor_name = wrapper._layer_to_wrap.inbound_nodes[0].keras_inputs[idx].name
                     encoding_dict = self._get_encoding_dict_for_quantizer(input_quantizer)
+                    if tensor_name in model_input_tensor_names:
+                        tensor_name += ":0"
                     activation_encodings[tensor_name] = encoding_dict
             for idx, param_quantizer in enumerate(wrapper.param_quantizers):
                 if param_quantizer.is_encoding_valid() or param_quantizer.data_type == QuantizationDataType.float:
@@ -372,7 +416,7 @@ class QuantizationSimModel(tf.keras.Model):
                     # because dense layers in quantizable MHA are not explicitly sublayers, they don't have their
                     # inbound_nodes parameter populated, so the name of the quantizer is used instead
                     if not wrapper._layer_to_wrap.inbound_nodes:
-                        tensor_name = "multi_head_attention/" + wrapper.name + "/" + output_quantizer.name
+                        tensor_name = wrapper.name + ":0"
                     elif isinstance(wrapper._layer_to_wrap.output, List):
                         tensor_name = wrapper._layer_to_wrap.output[idx].name
                     else:
@@ -445,7 +489,14 @@ class QuantizationSimModel(tf.keras.Model):
         :param custom_objects: If there are custom objects to load, Keras needs a dict of them to map them
         """
         model_path = os.path.join(path, filename_prefix)
-        self._model_without_wrappers.save(model_path)
+
+        #TF Version 2.4 has bug i.e. save() in tf format don't work for unrolled LSTM.
+        for layer in self._model_without_wrappers.layers:
+            if isinstance(layer, tf.keras.layers.LSTM):
+                break
+        else:
+            self._model_without_wrappers.save(model_path)
+
         self._model_without_wrappers.save(model_path + '.h5', save_format='h5')
 
         # Conversion of saved h5 model to pb model for consumption by SNPE/QNN
@@ -520,20 +571,25 @@ class QuantizationSimModel(tf.keras.Model):
         param_encodings = encodings['param_encodings']
         activation_encodings = encodings['activation_encodings']
 
+        model_input_tensor_names = [inp.name for inp in self.model.inputs]
+
         for wrapper in self.quant_wrappers():
             for idx, input_quantizer in enumerate(wrapper.input_quantizers):
-                # because dense layers in quantizable MHA are not explicitly sublayers, they don't have their
+                # because dense layers in quantizable MHA and RNN are not explicitly sublayers, they don't have their
                 # inbound_nodes parameter populated, so the name of the quantizer is used instead
                 if not wrapper._layer_to_wrap.inbound_nodes:
-                    tensor_name = "multi_head_attention/" + wrapper.name + "/" + input_quantizer.name
+                    tensor_name = wrapper.name + "/" + input_quantizer.name + ":0"
                 else:
                     tensor_name = wrapper._layer_to_wrap.inbound_nodes[0].keras_inputs[idx].name
+                if tensor_name in model_input_tensor_names:
+                    tensor_name += ":0"
 
                 if tensor_name in activation_encodings:
                     if not input_quantizer.is_enabled():
                         _logger.info("Not loading encodings for quantizer: %s as it is disabled", tensor_name)
                         continue
-                    encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(activation_encodings[tensor_name][0])
+                    encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(
+                        activation_encodings[tensor_name][0])
                     input_quantizer.tensor_quantizer.isEncodingValid = True
                     input_quantizer.set_quantizer_encodings(encoding.bw, is_symmetric, encoding,
                                                             libpymo.TensorQuantizerOpMode.quantizeDequantize)
@@ -551,12 +607,14 @@ class QuantizationSimModel(tf.keras.Model):
                         _logger.info("Not loading encodings for parameter: %s as quantizer is disabled", param_name)
                         continue
                     if isinstance(param_quantizer, StaticGridPerChannelQuantizer):
-                        encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(param_encodings[param_name])
+                        encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(
+                            param_encodings[param_name])
                         for tensor_quantizer in param_quantizer.tensor_quantizer:
                             tensor_quantizer.isEncodingValid = True
                         bw = encoding[0].bw
                     else:
-                        encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(param_encodings[param_name][0])
+                        encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(
+                            param_encodings[param_name][0])
                         param_quantizer.tensor_quantizer.isEncodingValid = True
                         bw = encoding.bw
                     param_quantizer.set_quantizer_encodings(bw, is_symmetric, encoding,
@@ -565,7 +623,8 @@ class QuantizationSimModel(tf.keras.Model):
                 else:
                     if param_quantizer.is_enabled():
                         param_quantizer.disable()
-                        _logger.info("Encoding for parameter: %s not present thus disabling this quantizer.", param_name)
+                        _logger.info("Encoding for parameter: %s not present thus disabling this quantizer.",
+                                     param_name)
 
             # Loading encodings means that compute encodings was called. Therefore, these two lines set the correct
             # op mode for the correct quant scheme and if the quantization was per channel or not.
@@ -576,7 +635,7 @@ class QuantizationSimModel(tf.keras.Model):
                 # because dense layers in quantizable MHA are not explicitly sublayers, they don't have their
                 # inbound_nodes parameter populated, so the name of the quantizer is used instead
                 if not wrapper._layer_to_wrap.inbound_nodes:
-                    tensor_name = "multi_head_attention/" + wrapper.name + "/" + output_quantizer.name
+                    tensor_name = wrapper.name + ":0"
                 else:
                     tensor_name = wrapper._layer_to_wrap.output.name
 
@@ -584,7 +643,8 @@ class QuantizationSimModel(tf.keras.Model):
                     if not output_quantizer.is_enabled():
                         _logger.info("Not loading encodings for quantizer: %s as it is disabled", tensor_name)
                         continue
-                    encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(activation_encodings[tensor_name][0])
+                    encoding, is_symmetric = keras_common_utils.create_encoding_from_dict(
+                        activation_encodings[tensor_name][0])
                     output_quantizer.tensor_quantizer.isEncodingValid = True
                     output_quantizer.set_quantizer_encodings(encoding.bw, is_symmetric, encoding,
                                                              libpymo.TensorQuantizerOpMode.quantizeDequantize)
@@ -613,7 +673,7 @@ class QuantizationSimModel(tf.keras.Model):
         for layer in self.model.layers:
             if isinstance(layer, QcQuantizeWrapper):
                 yield layer
-            if isinstance(layer, QcQuantizableMultiHeadAttention):
+            if isinstance(layer, tuple(substitutable_modules.values())):
                 yield from layer.quant_wrappers()
 
             # For Getting Quantizers from Sequantial Block
@@ -628,6 +688,7 @@ class QuantizationSimModel(tf.keras.Model):
         """
         return self._layer_name_to_quant_wrapper.get(layer_name)
 
+    # pylint: disable=too-many-locals
     def _fill_missing_encoding_min_max_gradients(self, gradients: list):
         """
         Computes the encoding min/max gradients and populates the gradients list
@@ -669,6 +730,21 @@ class QuantizationSimModel(tf.keras.Model):
 
                     gradients[enc_min_index] = dloss_by_dmin
                     gradients[enc_max_index] = dloss_by_dmax
+
+        # TODO: Remove this logic once this has been resolved in QNN/SNPE
+        # Go through activation quantizers (Input/Output) and set any ReLU's encoding min to 0
+        relu_quantize_wrappers = [
+            _layer for _layer in self.model.layers
+            if isinstance(_layer, QcQuantizeWrapper) and isinstance(_layer.original_layer, tf.keras.layers.ReLU)
+        ]
+
+        def _set_encoding_min_grad_to_None(quantizer):
+            enc_min_index = weight_name_to_index[quantizer.encoding_min.name]
+            gradients[enc_min_index] = None
+
+        for relu_quantizer in relu_quantize_wrappers:
+            for output_quantizer in relu_quantizer.output_quantizers:
+                _set_encoding_min_grad_to_None(output_quantizer)
 
     # pylint: disable=useless-super-delegation
     def get_config(self):
@@ -716,7 +792,7 @@ def quant_wrappers_for_sequential_block(seq_block: tf.keras.Sequential):
     for layer in seq_block.layers:
         if isinstance(layer, QcQuantizeWrapper):
             yield layer
-        if isinstance(layer, QcQuantizableMultiHeadAttention):
+        if isinstance(layer, tuple(substitutable_modules.values())):
             yield from layer.quant_wrappers()
 
         # in cases of nested Sequential Block

@@ -37,6 +37,7 @@
 
 import copy
 import logging
+from itertools import chain
 import json as json
 import os
 import shutil
@@ -53,6 +54,8 @@ from packaging.version import Version
 from torchvision import models
 
 import aimet_common.libpymo as libpymo
+
+import aimet_common.utils
 from aimet_common.defs import QuantScheme, QuantizationDataType, MAP_ROUND_MODE_TO_PYMO
 from aimet_common.quantsim_config.utils import get_path_for_per_channel_config
 from aimet_common.utils import AimetLogger
@@ -947,90 +950,107 @@ class TestQuantizationSimStaticGrad:
     def test_export_to_torch_script(self):
         """ test export functionality on ResNet18 """
 
-        resnet50 = models.resnet50()
-        resnet50.eval()
+        saved_flag = aimet_common.utils.SAVE_TO_YAML
+        aimet_common.utils.SAVE_TO_YAML = True
 
-        dummy_input = torch.randn(1, 3, 224, 224)
+        try:
+            resnet50 = models.resnet50()
+            resnet50.eval()
 
-        # Get Dict mapping node name to the input and output names
-        sim = QuantizationSimModel(resnet50, dummy_input)
+            dummy_input = torch.randn(1, 3, 224, 224)
 
-        def forward_pass(model, args):
-            model.eval()
-            with torch.no_grad():
-                model(torch.randn(1, 3, 224, 224))
+            # Get Dict mapping node name to the input and output names
+            sim = QuantizationSimModel(resnet50, dummy_input)
 
-        # Quantize
-        sim.compute_encodings(forward_pass, None)
+            def forward_pass(model, args):
+                model.eval()
+                with torch.no_grad():
+                    model(torch.randn(1, 3, 224, 224))
 
-        sim.export('./data/', 'resnet50', dummy_input, export_to_torchscript=True)
-        with open('./data/resnet50.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            # Quantize
+            sim.compute_encodings(forward_pass, None)
 
-        activation_keys = list(encoding_data["activation_encodings"].keys())
-        assert isinstance(encoding_data["activation_encodings"][activation_keys[0]], list)
+            with tempfile.TemporaryDirectory() as temp_dir:
 
-        param_keys = list(encoding_data["param_encodings"].keys())
-        assert param_keys[0] == "conv1.weight"
-        assert isinstance(encoding_data["param_encodings"]["conv1.weight"], list)
+                sim.export(temp_dir, 'resnet50', dummy_input, export_to_torchscript=True)
+                with open(os.path.join(temp_dir, 'resnet50.encodings')) as json_file:
+                    encoding_data = json.load(json_file)
 
-        with open('./data/resnet50.encodings.yaml') as yaml_file:
-            encoding_data = yaml.load(yaml_file, Loader=yaml.FullLoader)
+                activation_keys = list(encoding_data["activation_encodings"].keys())
+                assert isinstance(encoding_data["activation_encodings"][activation_keys[0]], list)
 
-        activation_keys = list(encoding_data["activation_encodings"].keys())
-        assert activation_keys[0] == "103"
-        assert isinstance(encoding_data["activation_encodings"]["103"], list)
+                param_keys = list(encoding_data["param_encodings"].keys())
+                assert param_keys[0] == "conv1.weight"
+                assert isinstance(encoding_data["param_encodings"]["conv1.weight"], list)
 
-        param_keys = list(encoding_data["param_encodings"].keys())
-        assert param_keys[0] == "conv1.weight"
-        assert isinstance(encoding_data["param_encodings"]["conv1.weight"], list)
+                with open(os.path.join(temp_dir, 'resnet50.encodings.yaml')) as yaml_file:
+                    encoding_data = yaml.load(yaml_file, Loader=yaml.FullLoader)
 
+                activation_keys = list(encoding_data["activation_encodings"].keys())
+                assert activation_keys[0] == "103"
+                assert isinstance(encoding_data["activation_encodings"]["103"], list)
+
+                param_keys = list(encoding_data["param_encodings"].keys())
+                assert param_keys[0] == "conv1.weight"
+                assert isinstance(encoding_data["param_encodings"]["conv1.weight"], list)
+
+        finally:
+            aimet_common.utils.SAVE_TO_YAML = saved_flag
     # -------------------------------------------
 
     def test_export_to_onnx(self):
         """Exporting encodings and model"""
 
-        dummy_input = (torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28))
+        saved_flag = aimet_common.utils.SAVE_TO_YAML
+        aimet_common.utils.SAVE_TO_YAML = True
 
-        def forward_pass(model, args):
-            model.eval()
-            with torch.no_grad():
-                model(*dummy_input)
+        try:
+            dummy_input = (torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28))
 
-        model = ModelWithTwoInputs()
-        sim = QuantizationSimModel(model, dummy_input=dummy_input)
+            def forward_pass(model, args):
+                model.eval()
+                with torch.no_grad():
+                    model(*dummy_input)
 
-        # Quantize
-        sim.compute_encodings(forward_pass, None)
+            model = ModelWithTwoInputs()
+            sim = QuantizationSimModel(model, dummy_input=dummy_input)
 
-        sim.model.conv1_a.param_quantizers['weight'].encoding.max = 10
-        sim.model.conv1_a.output_quantizers[0].encoding.max = 30
+            # Quantize
+            sim.compute_encodings(forward_pass, None)
 
-        # save encodings
-        sim.export('./data/', 'two_input_model', dummy_input)
+            sim.model.conv1_a.param_quantizers['weight'].encoding.max = 10
+            sim.model.conv1_a.output_quantizers[0].encoding.max = 30
 
-        # check the encodings
-        with open('./data/two_input_model.encodings', 'r') as fp:
-            encodings = json.load(fp)
+            with tempfile.TemporaryDirectory() as temp_dir:
 
-            activation_encodings = encodings['activation_encodings']
-            param_encodings = encodings['param_encodings']
-            assert 16 == len(activation_encodings)
-            assert 7 == len(param_encodings['conv1_a.weight'][0])
-            assert 10 == param_encodings['conv1_a.weight'][0]['max']
+                # save encodings
+                sim.export(temp_dir, 'two_input_model', dummy_input)
 
-        with open('./data/two_input_model.encodings.yaml', 'r') as fp_yaml:
-            encodings = yaml.load(fp_yaml, Loader=yaml.FullLoader)
+                # check the encodings
+                with open(os.path.join(temp_dir, 'two_input_model.encodings'), 'r') as fp:
+                    encodings = json.load(fp)
 
-            activation_encodings = encodings['activation_encodings']
-            param_encodings = encodings['param_encodings']
-            assert 16 == len(activation_encodings)
-            assert 7 == len(param_encodings['conv1_a.weight'][0])
-            assert 10 == param_encodings['conv1_a.weight'][0]['max']
+                    activation_encodings = encodings['activation_encodings']
+                    param_encodings = encodings['param_encodings']
+                    assert 16 == len(activation_encodings)
+                    assert 7 == len(param_encodings['conv1_a.weight'][0])
+                    assert 10 == param_encodings['conv1_a.weight'][0]['max']
 
-        # check the exported model
-        loaded_model = torch.load('./data/two_input_model.pth')
-        loaded_model(torch.rand(1, 1, 28, 28), torch.rand(1, 1, 28, 28))
+                with open(os.path.join(temp_dir, 'two_input_model.encodings.yaml'), 'r') as fp_yaml:
+                    encodings = yaml.load(fp_yaml, Loader=yaml.FullLoader)
+
+                    activation_encodings = encodings['activation_encodings']
+                    param_encodings = encodings['param_encodings']
+                    assert 16 == len(activation_encodings)
+                    assert 7 == len(param_encodings['conv1_a.weight'][0])
+                    assert 10 == param_encodings['conv1_a.weight'][0]['max']
+
+                # check the exported model
+                loaded_model = torch.load(os.path.join(temp_dir, 'two_input_model.pth'))
+                loaded_model(torch.rand(1, 1, 28, 28), torch.rand(1, 1, 28, 28))
+
+        finally:
+            aimet_common.utils.SAVE_TO_YAML = saved_flag
 
     # -------------------------------------------
     def test_no_fine_tuning_tf_enhanced(self):
@@ -2948,6 +2968,8 @@ class TestQuantizationSimStaticGrad:
         qsim = QuantizationSimModel(model=model, dummy_input=dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced,
                                     rounding_mode='nearest', default_output_bw=16, default_param_bw=8, in_place=False,
                                     config_file=None)
+        originally_enabled = {q: q.enabled for q in chain(*utils.get_all_quantizers(qsim.model))}
+
         def forward_pass(model, dummy_input):
             model.eval()
             with torch.no_grad():
@@ -2957,6 +2979,26 @@ class TestQuantizationSimStaticGrad:
             json.dump(partial_torch_encodings, fp)
 
         qsim.load_and_freeze_encodings("./temp_partial_torch_encodings.encodings")
+
+        # ``load_and_freeze_encodings`` shouldn't additionally enable or disable any quantizers
+        assert all(q.enabled == originally_enabled[q] for q in chain(*utils.get_all_quantizers(qsim.model)))
+
+        loaded_quantizers = [
+            qsim.model.conv1.input_quantizers[0],
+            qsim.model.conv1.param_quantizers['weight'],
+            qsim.model.conv2.output_quantizers[0],
+            qsim.model.fc2.output_quantizers[0],
+            qsim.model.fc2.param_quantizers['weight'],
+            qsim.model.relu1.output_quantizers[0],
+            qsim.model.relu3.output_quantizers[0],
+        ]
+
+        # ``load_and_freeze_encodings`` should freeze all the loaded quantizers
+        for q in chain(*utils.get_all_quantizers(qsim.model)):
+            if q in loaded_quantizers:
+                assert q.is_encoding_frozen
+            else:
+                assert not q.is_encoding_frozen
 
         qsim.compute_encodings(forward_pass, dummy_input)
         decimal_point_check = 6
@@ -3067,6 +3109,46 @@ class TestQuantizationSimStaticGrad:
             custom_module_outputs = sim_from_custom.model(*custom_module_inputs)
         assert torch.allclose(standard_module_outputs, custom_module_outputs, atol=1e-5)
 
+    @pytest.mark.parametrize(
+        "test_model", [test_models.ModelWithSplitModule, test_models.ModelWithReluAfterSplit]
+    )
+    def test_quantizer_enable_with_split_module(self, test_model):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = test_model().to(device)
+        model.eval()
+        dummy_input = torch.randn(6, 2, device=device)
+
+        quantsim_config = {
+            "defaults": {
+                "ops": {"is_output_quantized": "True"},
+                "params": {"is_quantized": "True", "is_symmetric": "True"},
+                "strict_symmetric": "False",
+            },
+            "params": {},
+            "op_type": {"Split": {"is_output_quantized": "False"}},
+            "supergroups": [],
+            "model_input": {"is_input_quantized": "True"},
+            "model_output": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = f"{temp_dir}/quantsim_config.json"
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+            sim = QuantizationSimModel(model, dummy_input, config_file=config_path)
+
+        if isinstance(model, test_models.ModelWithSplitModule):
+            split_module = sim.model.split
+        else:
+            split_module = sim.model.split_module.split
+
+        # is_input_quantized=True for model input
+        # First input quantizer should be enabled, second input quantizer is disabled as it's constant
+        assert split_module.input_quantizers[0].enabled
+        assert not split_module.input_quantizers[1].enabled
+
+        # All output quantizers of Split should be disabled because op specific config is set
+        for output_quantizer in split_module.output_quantizers:
+            assert not output_quantizer.enabled
 
 class TestQuantizationSimLearnedGrid:
 
@@ -3707,6 +3789,344 @@ class TestQuantizationSimLearnedGrid:
             for name in layer.param_quantizers:
                 if layer.param_quantizers[name].enabled:
                     assert layer.param_quantizers[name].encoding is not None
+
+    def test_load_encodings_to_sim_partial(self):
+        model = SmallMnist()
+        dummy_input = torch.rand(1, 1, 28, 28)
+
+        partial_torch_encodings = {
+            "activation_encodings": {
+                "conv1": {
+                    "input": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.9978924989700317,
+                            "min": 0.0,
+                            "offset": 0,
+                            "scale": 0.003913303837180138
+                        }
+                    }
+                },
+                "conv2": {
+                    "output": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.4923851788043976,
+                            "min": -0.43767568469047546,
+                            "offset": -120,
+                            "scale": 0.0036472973879426718
+                        }
+                    }
+                },
+                "fc2": {
+                    "output": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.1948324590921402,
+                            "min": -0.15752412378787994,
+                            "offset": -114,
+                            "scale": 0.0013817904982715845
+                        }
+                    }
+                },
+                "relu1": {
+                    "output": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 1.0608084201812744,
+                            "min": 0.0,
+                            "offset": 0,
+                            "scale": 0.004160033073276281
+                        }
+                    }
+                },
+                "relu3": {
+                    "output": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.5247029066085815,
+                            "min": 0.0,
+                            "offset": 0,
+                            "scale": 0.0020576585084199905
+                        }
+                    }
+                }
+            },
+            "excluded_layers": [],
+            "param_encodings": {
+                "conv1.weight": [
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.18757757544517517,
+                        "min": -0.2143743634223938,
+                        "offset": -8,
+                        "scale": 0.026796795427799225
+                    }
+                ],
+                "fc2.weight": [
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.13095608353614807,
+                        "min": -0.14966410398483276,
+                        "offset": -8,
+                        "scale": 0.018708012998104095
+                    }
+                ]
+            },
+            "quantizer_args": {
+                "activation_bitwidth": 8,
+                "dtype": "int",
+                "is_symmetric": True,
+                "param_bitwidth": 4,
+                "per_channel_quantization": False,
+                "quant_scheme": "post_training_tf_enhanced"
+            },
+            "version": "0.6.1"
+        }
+
+        qsim = QuantizationSimModel(model=model, dummy_input=dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                    rounding_mode='nearest', default_output_bw=16, default_param_bw=8, in_place=False,
+                                    config_file=None)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fname = os.path.join(temp_dir, "temp_partial_torch_encodings.encodings")
+            with open(fname, 'w') as f:
+                json.dump(partial_torch_encodings, f)
+
+            load_encodings_to_sim(qsim, fname)
+
+        loaded_quantizers = [
+            qsim.model.conv1.input_quantizers[0],
+            qsim.model.conv1.param_quantizers['weight'],
+            qsim.model.conv2.output_quantizers[0],
+            qsim.model.fc2.output_quantizers[0],
+            qsim.model.fc2.param_quantizers['weight'],
+            qsim.model.relu1.output_quantizers[0],
+            qsim.model.relu3.output_quantizers[0],
+        ]
+
+        # ``load_encodings_to_sim`` should disable all the quantizers
+        # whose corresponding encoding does not exist in the json file
+        for q in chain(*utils.get_all_quantizers(qsim.model)):
+            if q in loaded_quantizers:
+                assert q.enabled
+            else:
+                assert not q.enabled
+
+    def test_set_and_freeze_encodings_partial(self):
+        model = SmallMnist()
+        dummy_input = torch.rand(1, 1, 28, 28)
+
+        partial_torch_encodings = {
+            "excluded_layers": [],
+            "param_encodings": {
+                "conv1.weight": [
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.18757757544517517,
+                        "min": -0.2143743634223938,
+                        "offset": -8,
+                        "scale": 0.026796795427799225
+                    }
+                ],
+                "fc2.weight": [
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.13095608353614807,
+                        "min": -0.14966410398483276,
+                        "offset": -8,
+                        "scale": 0.018708012998104095
+                    }
+                ]
+            },
+            "quantizer_args": {
+                "activation_bitwidth": 8,
+                "dtype": "int",
+                "is_symmetric": True,
+                "param_bitwidth": 4,
+                "per_channel_quantization": False,
+                "quant_scheme": "post_training_tf_enhanced"
+            },
+            "version": "0.6.1"
+        }
+
+        qsim = QuantizationSimModel(model=model, dummy_input=dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                    rounding_mode='nearest', default_output_bw=16, default_param_bw=8, in_place=False,
+                                    config_file=None)
+        originally_enabled = {q: q.enabled for q in chain(*utils.get_all_quantizers(qsim.model))}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fname = os.path.join(temp_dir, "temp_partial_torch_encodings.encodings")
+            with open(fname, 'w') as f:
+                json.dump(partial_torch_encodings, f)
+
+            qsim.set_and_freeze_param_encodings(fname)
+
+        # ``set_and_freeze_param_encodings`` shouldn't additionally enable or disable any quantizers
+        assert all(q.enabled == originally_enabled[q] for q in chain(*utils.get_all_quantizers(qsim.model)))
+
+        loaded_quantizers = [
+            qsim.model.conv1.param_quantizers['weight'],
+            qsim.model.fc2.param_quantizers['weight'],
+        ]
+
+        # ``set_and_freeze_param_encodings`` should freeze all the loaded quantizers
+        for q in chain(*utils.get_all_quantizers(qsim.model)):
+            if q in loaded_quantizers:
+                assert q.is_encoding_frozen
+            else:
+                assert not q.is_encoding_frozen
+
+    @pytest.mark.parametrize('load_encodings_fn', [load_encodings_to_sim,
+                                                   QuantizationSimModel.load_and_freeze_encodings,
+                                                   QuantizationSimModel.set_and_freeze_param_encodings])
+    def test_legacy_load_encodings_mismatching_encoding(self, load_encodings_fn):
+        model = SmallMnist()
+        dummy_input = torch.rand(1, 1, 28, 28)
+
+        invalid_torch_encodings = {
+            "excluded_layers": [],
+            "activation_encodings": {
+                "conv999": {
+                    "input": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.9978924989700317,
+                            "min": 0.0,
+                            "offset": 0,
+                            "scale": 0.003913303837180138
+                        }
+                    }
+                },
+            },
+            "param_encodings": {
+                "conv999.weight": [ # NOTE: conv999 does not exist in the model
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.18757757544517517,
+                        "min": -0.2143743634223938,
+                        "offset": -8,
+                        "scale": 0.026796795427799225
+                    }
+                ],
+            },
+            "quantizer_args": {
+                "activation_bitwidth": 8,
+                "dtype": "int",
+                "is_symmetric": True,
+                "param_bitwidth": 4,
+                "per_channel_quantization": False,
+                "quant_scheme": "post_training_tf_enhanced"
+            },
+            "version": "0.6.1"
+        }
+
+        qsim = QuantizationSimModel(model=model, dummy_input=dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                    rounding_mode='nearest', default_output_bw=16, default_param_bw=8, in_place=False,
+                                    config_file=None)
+
+        """
+        When: Try to load encoding file some keys of which are missing in the model
+              (Note that conv999 does not exist in the model)
+        Then: Throw runtime error
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fname = os.path.join(temp_dir, "temp_partial_torch_encodings.encodings")
+            with open(fname, 'w') as f:
+                json.dump(invalid_torch_encodings, f)
+
+            with pytest.raises(RuntimeError):
+                load_encodings_fn(qsim, fname)
+
+    @pytest.mark.parametrize('load_encodings_fn', [load_encodings_to_sim,
+                                                   QuantizationSimModel.load_and_freeze_encodings,
+                                                   QuantizationSimModel.set_and_freeze_param_encodings])
+    def test_legacy_load_encodings_to_disabled_quantizer(self, load_encodings_fn):
+        model = SmallMnist()
+        dummy_input = torch.rand(1, 1, 28, 28)
+
+        invalid_torch_encodings = {
+            "excluded_layers": [],
+            "activation_encodings": {
+                "conv1": {
+                    "input": {
+                        "0": {
+                            "bitwidth": 8,
+                            "dtype": "int",
+                            "is_symmetric": "False",
+                            "max": 0.9978924989700317,
+                            "min": 0.0,
+                            "offset": 0,
+                            "scale": 0.003913303837180138
+                        }
+                    }
+                },
+            },
+            "param_encodings": {
+                "conv1.weight": [
+                    {
+                        "bitwidth": 4,
+                        "dtype": "int",
+                        "is_symmetric": "True",
+                        "max": 0.18757757544517517,
+                        "min": -0.2143743634223938,
+                        "offset": -8,
+                        "scale": 0.026796795427799225
+                    }
+                ],
+            },
+            "quantizer_args": {
+                "activation_bitwidth": 8,
+                "dtype": "int",
+                "is_symmetric": True,
+                "param_bitwidth": 4,
+                "per_channel_quantization": False,
+                "quant_scheme": "post_training_tf_enhanced"
+            },
+            "version": "0.6.1"
+        }
+
+        qsim = QuantizationSimModel(model=model, dummy_input=dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                    rounding_mode='nearest', default_output_bw=16, default_param_bw=8, in_place=False,
+                                    config_file=None)
+
+        """
+        Given: Input/param quantizers of conv1 is disabled
+        When: Try to load input/param quantizers to conv1
+        Then: Throw runtime error
+        """
+        qsim.model.conv1.input_quantizers[0].enabled = False
+        qsim.model.conv1.param_quantizers['weight'].enabled = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fname = os.path.join(temp_dir, "temp_partial_torch_encodings.encodings")
+            with open(fname, 'w') as f:
+                json.dump(invalid_torch_encodings, f)
+
+            with pytest.raises(RuntimeError):
+                load_encodings_fn(qsim, fname)
 
     def test_inplace_modification_with_relu(self):
         """
@@ -4467,6 +4887,347 @@ class TestQuantizationSimLearnedGrid:
             out.sum().backward()
             optimizer.step()
             optimizer.zero_grad()
+
+    @pytest.mark.parametrize("hw_version", ['V69', 'V73', 'V75'])
+    @pytest.mark.parametrize("quant_scheme", [QuantScheme.post_training_tf,
+                                              QuantScheme.training_range_learning_with_tf_init,
+                                              QuantScheme.post_training_tf_enhanced,
+                                              QuantScheme.training_range_learning_with_tf_enhanced_init])
+    def test_exception_for_embedding(self, hw_version, quant_scheme):
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        model = test_models.ModelWithEmbedding().to(device)
+        dummy_input = torch.tensor([[1, 4, 2, 5], [4, 3, 2, 7]], dtype=torch.int64, device=device)
+
+        quantsim_config = {
+            "defaults": {
+                "hw_version": hw_version,
+                "ops": {"is_output_quantized": "True"}, "params": {"is_symmetric": "True"}
+            },
+            "params": {},
+            "op_type": {
+                    "Gather":
+                    {
+                      "is_output_quantized": "False",
+                      "per_channel_quantization": "False"
+                    },
+            },
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme,
+                                       default_param_bw=4,
+                                       default_output_bw=16,
+                                       config_file=config_path)
+
+        sim.compute_encodings(lambda sim_model, _: sim_model(dummy_input),
+                              forward_pass_callback_args=None)
+
+        wrapper = sim.model.embedding
+        weight_quantizer = wrapper.param_quantizers["weight"]
+        output_quantizer = wrapper.output_quantizers[0]
+        if sim._hw_version in {"V73", "V75"}:
+            assert weight_quantizer.bitwidth == output_quantizer.bitwidth
+            assert not isinstance(weight_quantizer.encoding, list)
+            assert weight_quantizer.use_symmetric_encodings == output_quantizer.use_symmetric_encodings
+        else:
+            assert weight_quantizer.bitwidth != output_quantizer.bitwidth
+            assert weight_quantizer.use_symmetric_encodings != output_quantizer.use_symmetric_encodings
+
+    @pytest.mark.parametrize('hw_version', ['V69', 'V73', 'V75'])
+    @pytest.mark.parametrize('quant_scheme', [QuantScheme.post_training_tf,
+                                              QuantScheme.training_range_learning_with_tf_init,
+                                              QuantScheme.post_training_tf_enhanced,
+                                              QuantScheme.training_range_learning_with_tf_enhanced_init])
+    def test_exception_for_groupnorm(self, hw_version, quant_scheme):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        model = test_models.ModelWithGroupNorm().to(device)
+        dummy_input = torch.randn((1, 6, 2, 2), device=device)
+
+        quantsim_config = {
+            "defaults": {
+                "hw_version": hw_version,
+                "ops": {"is_output_quantized": "True"}, "params": {"is_symmetric": "True"}
+            },
+            "params": {},
+            "op_type": {
+                    "GroupNorm":
+                    {
+                      "per_channel_quantization": "False",
+                      "params": {
+                        "bias":
+                        {
+                          "is_quantized": "True"
+                        }
+                      }
+                    },
+            },
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme,
+                                       default_param_bw=4,
+                                       default_output_bw=16,
+                                       config_file=config_path)
+
+        sim.compute_encodings(lambda sim_model, _: sim_model(dummy_input),
+                              forward_pass_callback_args=None)
+
+        wrapper = sim.model.gn
+        weight_quantizer = wrapper.param_quantizers['weight']
+        bias_quantizer = wrapper.param_quantizers['bias']
+        output_quantizer = wrapper.output_quantizers[0]
+        if sim._hw_version in {'V73', 'V75'}:
+            assert weight_quantizer.bitwidth == output_quantizer.bitwidth
+            assert weight_quantizer.use_symmetric_encodings == output_quantizer.use_symmetric_encodings
+            assert not isinstance(weight_quantizer.encoding, list)
+            assert bias_quantizer.enabled
+            assert bias_quantizer.bitwidth == output_quantizer.bitwidth
+            assert bias_quantizer.use_symmetric_encodings == output_quantizer.use_symmetric_encodings
+        else:
+            assert weight_quantizer.bitwidth != output_quantizer.bitwidth
+            assert weight_quantizer.use_symmetric_encodings != output_quantizer.use_symmetric_encodings
+            assert bias_quantizer.bitwidth != output_quantizer.bitwidth
+            assert bias_quantizer.use_symmetric_encodings != output_quantizer.use_symmetric_encodings
+
+    @pytest.mark.parametrize('hw_version', ['V69', 'V73', 'V75'])
+    @pytest.mark.parametrize('quant_scheme', [QuantScheme.post_training_tf,
+                                              QuantScheme.training_range_learning_with_tf_init,
+                                              QuantScheme.post_training_tf_enhanced,
+                                              QuantScheme.training_range_learning_with_tf_enhanced_init])
+    @pytest.mark.parametrize('default_output_bw', [8, 16])
+    def test_exception_for_matmul_if_input_quantization_disabled(self, hw_version, quant_scheme, default_output_bw):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        model = test_models.ModelWithMatMul().to(device)
+        dummy_input = (torch.randn(10, 3, 4, device=device), torch.randn(10, 5, 4, device=device))
+
+        quantsim_config = {
+            "defaults": {
+                "hw_version": hw_version,
+                "ops": {"is_output_quantized": "True"}, "params": {"is_symmetric": "True"}
+            },
+            "params": {},
+            "op_type": {},
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme,
+                                       config_file=config_path,
+                                       default_output_bw=default_output_bw,
+                                       default_param_bw=4)
+
+        sim.compute_encodings(lambda sim_model, _: sim_model(*dummy_input),
+                              forward_pass_callback_args=None)
+
+        closest_output_quantizer_of_second_input = sim.model.act2.output_quantizers[0]
+        if sim._hw_version in {'V73', 'V75'}:
+            if default_output_bw == 16:
+                assert closest_output_quantizer_of_second_input.use_symmetric_encodings
+
+                if sim._hw_version == 'V73':
+                    assert closest_output_quantizer_of_second_input.bitwidth == 8
+                else:   # sim._hw_version == 'V75'
+                    assert closest_output_quantizer_of_second_input.bitwidth == 16
+            else:   # default_output_bw == 8
+                assert not closest_output_quantizer_of_second_input.use_symmetric_encodings
+        else:
+            assert not closest_output_quantizer_of_second_input.use_symmetric_encodings
+
+    @pytest.mark.parametrize('hw_version', ['default', 'V73', 'V69', 'V75'])
+    @pytest.mark.parametrize('quant_scheme', [QuantScheme.post_training_tf,
+                                              QuantScheme.training_range_learning_with_tf_init,
+                                              QuantScheme.post_training_tf_enhanced,
+                                              QuantScheme.training_range_learning_with_tf_enhanced_init])
+    @pytest.mark.parametrize('default_output_bw', [8, 16])
+    @pytest.mark.parametrize('producer_output_quantization_enabled', [False, True])
+    def test_exception_for_matmul_if_input_quantization_enabled(self, hw_version, quant_scheme, default_output_bw,
+                                                                producer_output_quantization_enabled):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        # Temporarily add elementwise_ops.MatMul entry to apply op_type config
+        original_map_torch_types_to_onnx = copy.deepcopy(onnx_utils.map_torch_types_to_onnx)
+        onnx_utils.map_torch_types_to_onnx[elementwise_ops.MatMul] = ['MatMul']
+
+        model = test_models.ModelWithMatMul().to(device)
+        dummy_input = (torch.randn(10, 3, 4, device=device), torch.randn(10, 5, 4, device=device))
+
+        quantsim_config = {
+            "defaults": {
+                "hw_version": hw_version,
+                "ops": {"is_output_quantized": "True"}, "params": {}
+            },
+            "params": {},
+            "op_type": {
+                "MatMul": {"is_input_quantized": "True"},
+                "Relu": {"is_output_quantized": str(producer_output_quantization_enabled)}
+            },
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme,
+                                       config_file=config_path,
+                                       default_output_bw=default_output_bw,
+                                       default_param_bw=4)
+
+        sim.compute_encodings(lambda sim_model, _: sim_model(*dummy_input),
+                              forward_pass_callback_args=None)
+        first_input_quantizer, second_input_quantizer = sim.model.matmul.input_quantizers
+        if sim._hw_version in {'V73', 'V75'}:
+            if default_output_bw == 16:
+                assert second_input_quantizer.use_symmetric_encodings
+
+                if sim._hw_version == 'V73':
+                    assert second_input_quantizer.bitwidth == 8
+                else:  # sim._hw_version == 'V75'
+                    assert second_input_quantizer.bitwidth == 16
+            else:
+                assert not second_input_quantizer.use_symmetric_encodings
+        else:
+            assert not second_input_quantizer.use_symmetric_encodings
+
+        # Restore original mapping dictionary
+        onnx_utils.map_torch_types_to_onnx = original_map_torch_types_to_onnx
+
+    @pytest.mark.parametrize('hw_version', ['V73', 'V75'])
+    @pytest.mark.parametrize('quant_scheme', [QuantScheme.post_training_tf,
+                                              QuantScheme.training_range_learning_with_tf_init,
+                                              QuantScheme.post_training_tf_enhanced,
+                                              QuantScheme.training_range_learning_with_tf_enhanced_init])
+    def test_exception_for_matmul_edge_case(self, hw_version, quant_scheme):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        model = test_models.ModelWithMatMul().to(device)
+        dummy_input = (torch.randn(10, 3, 4, device=device), torch.randn(10, 5, 4, device=device))
+        quantsim_config = {
+            "defaults": {"hw_version": hw_version, "ops": {"is_output_quantized": "True"}, "params": {}},
+            "params": {},
+            "op_type": {
+                "Relu": {"is_output_quantized": "False"},
+            },
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme,
+                                       config_file=config_path,
+                                       default_output_bw=16,
+                                       default_param_bw=4)
+
+        sim.compute_encodings(lambda sim_model, _: sim_model(*dummy_input),
+                              forward_pass_callback_args=None)
+
+        first_input_quantizer, second_input_quantizer = sim.model.matmul.input_quantizers
+        closest_output_quantizer_of_second_input = sim.model.act2.output_quantizers[0]
+
+        assert not second_input_quantizer.use_symmetric_encodings
+        assert not closest_output_quantizer_of_second_input.use_symmetric_encodings
+
+    @pytest.mark.parametrize("hw_version", ["V73", "V75"])
+    @pytest.mark.parametrize(
+        "quant_scheme",
+        [
+            QuantScheme.post_training_tf,
+            QuantScheme.training_range_learning_with_tf_init,
+            QuantScheme.post_training_tf_enhanced,
+            QuantScheme.training_range_learning_with_tf_enhanced_init,
+        ],
+    )
+    @pytest.mark.parametrize("default_output_bw", [8, 16])
+    def test_exception_for_matmul_edge_case2(
+            self, hw_version, quant_scheme, default_output_bw
+    ):
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        model = test_models.ModelWithMatMul2().to(device)
+        dummy_input = (
+            torch.randn(10, 3, 4, device=device),
+            torch.randn(10, 5, 4, device=device),
+        )
+
+        quantsim_config = {
+            "defaults": {
+                "hw_version": hw_version,
+                "ops": {"is_output_quantized": "True"},
+                "params": {},
+            },
+            "params": {},
+            "op_type": {
+                "Relu": {"is_output_quantized": "False"},
+            },
+            "supergroups": [],
+            "model_input": {},
+            "model_output": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "quantsim_config.json")
+
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+
+            sim = QuantizationSimModel(
+                model,
+                dummy_input,
+                quant_scheme,
+                config_file=config_path,
+                default_output_bw=default_output_bw,
+                default_param_bw=4,
+            )
+
+        sim.compute_encodings(
+            lambda sim_model, _: sim_model(*dummy_input), forward_pass_callback_args=None
+        )
+
+        closest_output_quantizer_of_second_input = sim.model.act3.output_quantizers[0]
+        if sim._hw_version in {"V73", "V75"}:
+            if default_output_bw == 16:
+                assert closest_output_quantizer_of_second_input.use_symmetric_encodings
+
+                if sim._hw_version == "V73":
+                    assert closest_output_quantizer_of_second_input.bitwidth == 8
+                else:  # sim._hw_version == 'V75'
+                    assert closest_output_quantizer_of_second_input.bitwidth == 16
+
+            else:  # default_output_bw == 8
+                assert not closest_output_quantizer_of_second_input.use_symmetric_encodings
+        else:
+            assert not closest_output_quantizer_of_second_input.use_symmetric_encodings
 
 
 @pytest.mark.cuda

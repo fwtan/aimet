@@ -40,7 +40,7 @@ from typing import List, Tuple, Dict, Union
 import tensorflow as tf
 from tensorflow.keras import layers
 
-from packaging import version
+from packaging import version  # pylint: disable=wrong-import-order
 if version.parse(tf.version.VERSION) >= version.parse("2.10.1"):
     from keras.layers.core.tf_op_layer import TFOpLambda  # pylint: disable=import-error
 else:
@@ -185,7 +185,7 @@ def _initialize_input_quantizers(layer: layers.Layer, quant_settings: QuantizerS
                                                                 quant_settings.is_symmetric,
                                                                 quant_settings.use_strict_symmetric,
                                                                 quant_settings.use_unsigned_symmetric,
-                                                                enabled and layer.output.dtype in QUANT_ALLOWED_DTYPES)
+                                                                enabled and (layer.input[i].dtype if num_inputs > 1 else layer.input.dtype) in QUANT_ALLOWED_DTYPES)
         input_quantizers.append(activation_tensor_quantizer)
     return input_quantizers
 
@@ -288,8 +288,7 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
     def __init__(self, connected_graph: ConnectedGraph, quant_scheme: Union[QuantScheme, str], rounding_mode: str,
                  default_output_bw: int, default_param_bw: int,
                  default_data_type: QuantizationDataType = QuantizationDataType.int, config_file: str = None):
-        super(QuantSimConfigurator, self).__init__(config_file, default_data_type, default_output_bw,
-                                                   default_param_bw)
+        super().__init__(config_file, default_data_type, default_output_bw, default_param_bw)
         self._connected_graph = connected_graph
         self._layer_to_affected_quantizer_info_dict = self._create_layer_to_affected_quantizer_info_dict()
         self._layer_to_config_dict = TreeLikeDictionary()

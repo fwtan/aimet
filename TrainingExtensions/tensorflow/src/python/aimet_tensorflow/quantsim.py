@@ -44,7 +44,7 @@ import json
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops as tf_ops
-from packaging import version
+from packaging import version  # pylint: disable=wrong-import-order
 
 import aimet_common.libpymo as libpymo
 import aimet_common.libaimet_tf_ops as qcops
@@ -273,9 +273,9 @@ class QuantizationSimModel:
         :param activation_op_names: List of ops for which activation quantization ops were inserted for
         """
         if not conn_graph:
-            error_msg = (f'Connected graph passed into configure_quantization_ops() is None. If manual insertion of '
-                         f'quantization ops is being done, and get_ops_to_quantize_activations_for() has been '
-                         f'overriden, please override configure_quantization_ops() as well.')
+            error_msg = ('Connected graph passed into configure_quantization_ops() is None. If manual insertion of '
+                         'quantization ops is being done, and get_ops_to_quantize_activations_for() has been '
+                         'overriden, please override configure_quantization_ops() as well.')
             _logger.error(error_msg)
             raise AssertionError(error_msg)
         self._op_to_quant_ops_dict = create_op_to_quant_ops_dict(self.session.graph, conn_graph, ops_with_param_names, indices,
@@ -1285,7 +1285,7 @@ class QuantizationSimModel:
 
             # Add to quantizer dict
             quantizer_info = QuantizerInfo(self.session, tensor_quantizer, quant_op_name, quantizer_type,
-                                           self._quant_scheme, axis_handling)
+                                           self._quant_scheme, self.per_channel_quantization_enabled, axis_handling)
             quantizer_dict[quant_op_name] = quantizer_info
 
             self.session.run([op_mode_var.initializer, tensor_quant_ref.initializer, encoding_min.initializer,

@@ -37,13 +37,17 @@
 """ Utilities that are used for different AIMET PyTorch features """
 
 import importlib
+import inspect
 import itertools
-from typing import List, Tuple, Union, Dict, Callable, Any, Iterable
+from typing import List, Tuple, Union, Dict, Callable, Any, Iterable, Optional, TextIO
 import contextlib
 import os
 import pickle
 import sys
 import functools
+import logging
+import warnings
+
 import numpy as np
 import torch.nn
 import torch
@@ -52,9 +56,12 @@ from torchvision import datasets, transforms
 
 from aimet_common.defs import QuantScheme, QuantizationDataType, MAP_QUANT_SCHEME_TO_PYMO
 from aimet_common.utils import AimetLogger, Handle, log_with_error_and_assert_if_false
+from aimet_common.utils import profile as _profile
 import aimet_common.libpymo as libpymo
 from aimet_torch import elementwise_ops
-
+from aimet_torch.tensor_quantizer import TensorQuantizer
+from aimet_torch.v2.nn.base import BaseQuantizationMixin
+from aimet_torch.v2.utils import _ContextManager
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 
@@ -113,7 +120,7 @@ class ModuleData:
         :return: Module's input and output data
         """
         def adjust_input_dtype(module, inp):
-            if hasattr(module, 'weight'):
+            if hasattr(module, 'weight') and module.weight is not None:
                 dtype = module.weight.dtype
                 # Cast input to dtype only if it is a floating point tensor (float, half, bfloat16, etc.).
                 # If input is a non-float tensor (e.g. long, bool), leave the input uncasted.
@@ -337,6 +344,13 @@ def run_hook_for_layers_with_given_input(model: torch.nn.Module,
             else:
                 if isinstance(input_tensor, (list, tuple)):
                     _ = model(*input_tensor)
+                elif isinstance(input_tensor, dict):
+                    try:
+                        _ = model(**input_tensor)
+                    except TypeError:
+                        # Some models require inputs as dict.
+                        # https://github.com/pytorch/vision/blob/ef2920cc80bac61282b3b19a775b3c33de4e7551/torchvision/ops/feature_pyramid_network.py#L172
+                        _ = model(input_tensor)
                 else:
                     _ = model(input_tensor)
 
@@ -678,38 +692,38 @@ def get_ordered_lists_of_conv_fc(model: torch.nn.Module, input_shapes: Tuple,
     return module_list
 
 
-def change_tensor_device_placement(tensor_data: Union[torch.Tensor, List, Tuple], device: torch.device):
+def change_tensor_device_placement(input_data: Union[torch.Tensor, List, Tuple], device: torch.device):
     """
     Change the tensor_data's device placement
 
-    :param tensor_data: torch.tensor , list of torch.tensors, or tuple of torch.tensors
+    :param input_data: torch.tensor , list of torch.tensors, or tuple of torch.tensors
     :param device: device
     :return: tensor_data with modified device placement
     """
-    return nested_map(tensor_data,
-                      lambda x: x.to(device=device) if isinstance(x, (torch.Tensor, torch.nn.Module)) else x)
+    return nested_map(input_data, lambda x: x.to(device=device))
 
 
-def nested_map(tensor, fn: Callable[[torch.Tensor], torch.Tensor]):
+def nested_map(data, fn: Callable[[torch.Tensor], torch.Tensor]):
     """
     Apply a function to a nested tuple, list, or dict of tensors.
-    :param tensor: Tensor, or a nested tuple, list, or dict of tensors.
+    :param data: Tensor, or a nested tuple, list, or dict of tensors.
     :param fn: Function to apply to the tensors
     :return: Nested structure of tensors with function applied
     """
-    if isinstance(tensor, torch.Tensor):
-        return fn(tensor)
+    if isinstance(data, torch.Tensor):
+        return fn(data)
 
-    if isinstance(tensor, (tuple, list)):
-        cls = tuple if isinstance(tensor, tuple) else list
-        return cls(nested_map(x, fn) for x in tensor)
+    if isinstance(data, (tuple, list)):
+        cls = tuple if isinstance(data, tuple) else list
+        return cls(nested_map(x, fn) for x in data)
 
-    if isinstance(tensor, dict):
+    if isinstance(data, dict):
         return {
-            key: nested_map(value, fn) for key, value in tensor.items()
+            key: nested_map(value, fn) for key, value in data.items()
         }
 
-    raise TypeError(f'Input should be torch.Tensor, tuple, list, or dict. Got {type(tensor)}')
+    logger.debug('unexpected input type=%s, expecting torch.Tensor, tuple, list, or dict. skipping..', type(data))
+    return data
 
 
 def find_num_inout_tensors_per_module(model: torch.nn.Module, input_tensor) -> Dict:
@@ -838,17 +852,19 @@ def in_train_mode(module: Union[torch.nn.Module, Iterable[torch.nn.Module]]):
 @contextlib.contextmanager
 def _in_mode(modules: Union[torch.nn.Module, Iterable[torch.nn.Module]], train: bool):
     if isinstance(modules, torch.nn.Module):
-        modules = [modules]
+        modules = (modules,)
 
-    original_modes = [module.training for module in modules]
+    modules = set(itertools.chain(*(m.modules() for m in modules)))
+
+    original_modes = {module: module.training for module in modules}
 
     try:
         for module in modules:
-            module.train(mode=train)
+            module.training = train
         yield
     finally:
-        for module, original_mode in zip(modules, original_modes):
-            module.train(mode=original_mode)
+        for module, original_mode in original_modes.items():
+            module.training = original_mode
 
 
 def is_torch_nn_module(module: torch.nn.Module) -> bool:
@@ -907,8 +923,12 @@ def get_all_quantizers(model: torch.nn.Module):
     :param model: Root module
     :returns: List of parameter, input, and output quantizers
     """
-    from aimet_torch.qc_quantize_op import QcQuantizeWrapper
-    from aimet_torch.qc_quantize_recurrent import QcQuantizeRecurrent
+    for m in model.modules():
+        if isinstance(m, BaseQuantizationMixin):
+            raise NotImplementedError(f'{get_all_quantizers.__qualname__} is not supported in AIMET 2')
+
+    from aimet_torch.qc_quantize_op import QcQuantizeWrapper# pylint: disable=import-outside-toplevel
+    from aimet_torch.qc_quantize_recurrent import QcQuantizeRecurrent# pylint: disable=import-outside-toplevel
 
     param_quantizers = []
     input_quantizers = []
@@ -938,6 +958,10 @@ def disable_all_quantizers(model: torch.nn.Module) -> Handle:
     :param model: Root module
     :returns: Handle that enable all quantizers in the model upon handle.remove().
     """
+    for m in model.modules():
+        if isinstance(m, BaseQuantizationMixin):
+            raise NotImplementedError(f'{disable_all_quantizers.__qualname__} is not supported in AIMET 2')
+
     param_quantizers, input_quantizers, output_quantizers = get_all_quantizers(model)
     all_quantizers = param_quantizers + input_quantizers + output_quantizers
 
@@ -980,7 +1004,31 @@ def get_named_module(model, name):
     return functools.reduce(getattr, name.split("."), model)
 
 
-def cache_intermediate_datasets(cached_dataset, cache_on_cpu, model, module_name, forward_fn, path=None):
+def add_foward_fn_kwargs_to_inputs(module: torch.nn.Module, *args: Tuple[Any], **kwargs: Dict[str, Any]) -> Tuple[Any]:
+    """
+    flattens input in the format of '*args, **kwargs' to tuple along with adding defaults when value not provided.
+    :param module: torch module corresponding to the input provided
+    :return: input as tuple.
+    """
+    add_args = []
+    parameter_defaults = inspect.signature(module.forward).parameters
+    param_keys = list(parameter_defaults.keys())
+    if param_keys[0] == "self":
+        param_keys = param_keys[1:]
+    for k in param_keys[len(args):]: # capture additional args with either kwargs or defaults
+        if k in kwargs:
+            add_args.append(kwargs[k])
+        else:
+            default = parameter_defaults[k]
+            if default != inspect.Parameter.empty:
+                add_args.append(default)
+            else:
+                ValueError(f'no value provided for kwarg={k}, which has no defaults')
+    return tuple([*args, *add_args])
+
+
+def cache_intermediate_datasets(
+        cached_dataset, cache_on_cpu, model, module_name, forward_fn, path=None, incl_kwargs: bool = False):
     """
     Cache the input tensor of the target module and save to CPU or disk for latter usage
     :param cached_dataset: Cached dataset
@@ -989,21 +1037,29 @@ def cache_intermediate_datasets(cached_dataset, cache_on_cpu, model, module_name
     :param module_name: Name of the target module
     :param forward_fn: Forward function that performs forward pass given a model and inputs
     :param path: Location to save cached data if caching to dick
+    :param incl_kwargs: if True, capture kwargs, normalize and attach to inputs.
     :return: Cached data on CPU
     """
     # pylint: disable=cell-var-from-loop
     cached_data = []
-
+    module = get_named_module(model, module_name)
     iterator = iter(cached_dataset)
     for idx in range(len(cached_dataset)):
         def fn(_, inputs):
+            if incl_kwargs:
+                module_forward_fn = inspect.currentframe().f_back
+                assert inspect.getframeinfo(module_forward_fn).function == '_call_impl'  # forward function proxy
+                kwargs = module_forward_fn.f_locals['kwargs']
+                if kwargs:
+                    inputs = add_foward_fn_kwargs_to_inputs(module, *inputs, **kwargs)
+
             inputs = [*inputs]
             if cache_on_cpu:
-                cached_data.append([inp.cpu() for inp in inputs])
+                cached_data.append(change_tensor_device_placement(inputs, torch.device('cpu')))
             else:
                 save_to_cache(inputs, path, idx)
             raise StopForwardException
-        handle = get_named_module(model, module_name).register_forward_pre_hook(fn)
+        handle = module.register_forward_pre_hook(fn)
         data = next(iterator)
         try:
             with in_eval_mode(model), torch.no_grad():
@@ -1104,3 +1160,84 @@ def get_v1_quant_scheme_for_initialization(quant_scheme: QuantScheme) -> QuantSc
         return QuantScheme.post_training_tf_enhanced
 
     return quant_scheme
+
+
+def compute_partial_encoding(quantizer: TensorQuantizer, encoding_dict: Dict) -> Dict:
+    """
+    Generates the full encoding from partially provided encoding.
+
+    :param quantizer:  Quantizer object for which the encoding needs to be computed.
+    :param encoding_dict: Partial Encoding
+    :return: Full encoding
+    """
+
+    encoding = libpymo.TfEncoding()
+    encoding.bw = encoding_dict.get('bitwidth')
+    encoding.max = encoding_dict.get('max', 0)
+    encoding.min = encoding_dict.get('min', 0)
+    encoding.delta = encoding_dict.get('scale', 0)
+    encoding.offset = encoding_dict.get('offset', 0)
+
+    if not (encoding.max == 0 and encoding.min == 0) and encoding.delta != 0:
+        return encoding_dict
+
+    partial_quantizer = libpymo.TensorQuantizer(libpymo.QuantizationMode.QUANTIZATION_TF, quantizer.round_mode)
+    partial_quantizer.computePartialEncoding(encoding.bw, encoding, quantizer.use_symmetric_encodings,
+                                             quantizer.use_unsigned_symmetric, quantizer.use_strict_symmetric)
+
+    encoding_dict['max'] = encoding.max
+    encoding_dict['min'] = encoding.min
+    encoding_dict['scale'] = encoding.delta
+    encoding_dict['offset'] = encoding.offset
+    encoding_dict['is_symmetric'] = 'True' if quantizer.use_symmetric_encodings else 'False'
+
+    return encoding_dict
+
+
+def deprecated(msg: str):
+    """
+    Wrap a function or class such that a deprecation warning is printed out when invoked
+    """
+    def colored(msg: str):
+        # Color the string with red
+        return '\x1b[31;21m' + msg + '\x1b[0m'
+
+    def decorator(_callable):
+        @functools.wraps(_callable)
+        def fn_wrapper(*args, **kwargs):
+            warnings.warn(colored(f'{_callable.__qualname__} will be deprecated soon in the later versions. {msg}'),
+                          DeprecationWarning, stacklevel=2)
+            return _callable(*args, **kwargs)
+        return fn_wrapper
+    return decorator
+
+
+def profile(label: str, file: Union[str, os.PathLike, TextIO] = None, new_file: bool = False, logger: Optional[logging.Logger] = None): # pylint: disable=redefined-outer-name
+    """
+    Profile a block of code and save profiling information into a file.
+
+    :param label: String label associated with the block of code to profile (shows up in the profiling print)
+    :param file: File path and name or a file-like object to send output text to (Default: stdout)
+    :param new_file: True if a new file is to be created to hold profiling info, False if an existing file should be
+        appended to. This flag is only valid when ``file`` is a path, not a file-like object.
+    :param logger: If logger is provided, profiling string will also be printed with INFO logging level
+    """
+    if not torch.cuda.is_available():
+        return profile_async(label, file, new_file, logger)
+
+    ctx = _profile(label, file, new_file, logger, cleanup=torch.cuda.synchronize)
+    return _ContextManager(action=ctx.__enter__, cleanup=lambda: ctx.__exit__(None, None, None)) # pylint: disable=no-member
+
+
+def profile_async(label: str, file: Union[str, os.PathLike, TextIO] = None, new_file: bool = False, logger: Optional[logging.Logger] = None): # pylint: disable=redefined-outer-name
+    """
+    Profile a block of code and save profiling information into a file.
+
+    :param label: String label associated with the block of code to profile (shows up in the profiling print)
+    :param file: File path and name or a file-like object to send output text to (Default: stdout)
+    :param new_file: True if a new file is to be created to hold profiling info, False if an existing file should be
+        appended to. This flag is only valid when ``file`` is a path, not a file-like object.
+    :param logger: If logger is provided, profiling string will also be printed with INFO logging level
+    """
+    ctx = _profile(label, file, new_file, logger, cleanup=None)
+    return _ContextManager(action=ctx.__enter__, cleanup=lambda: ctx.__exit__(None, None, None)) # pylint: disable=no-member

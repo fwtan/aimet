@@ -52,6 +52,63 @@ from aimet_torch import elementwise_ops
 from aimet_torch.elementwise_ops import Multiply
 
 
+class ModelWithMatMul(torch.nn.Module):
+    """
+    Model with MatMul module
+    """
+    def __init__(self):
+        super().__init__()
+        self.act1 = nn.PReLU()
+        self.act2 = nn.ReLU()
+        self.matmul = elementwise_ops.MatMul()
+
+    def forward(self, *inputs):
+        x = self.act1(inputs[0])
+        y = self.act2(inputs[1])
+        y = y.reshape(10, 4, 5)
+        return self.matmul(x, y)
+
+class ModelWithMatMul2(torch.nn.Module):
+    """
+    Model with MatMul module
+    """
+    def __init__(self):
+        super().__init__()
+        self.act1 = nn.PReLU()
+        self.act2 = nn.ReLU()
+        self.act3 = nn.Softmax()
+        self.matmul = elementwise_ops.MatMul()
+
+    def forward(self, *inputs):
+        x = self.act1(inputs[0])
+        y = self.act3(inputs[1])
+        y = self.act2(y)
+        y = y.reshape(10, 4, 5)
+        return self.matmul(x, y)
+
+class ModelWithGroupNorm(torch.nn.Module):
+    """
+    Model with GroupNorm module
+    """
+    def __init__(self):
+        super().__init__()
+        self.gn = torch.nn.GroupNorm(2, 6)
+        self.gn_with_no_affine = torch.nn.GroupNorm(2, 6, affine=False)
+
+    def forward(self, *inputs):
+        return self.gn_with_no_affine(self.gn(inputs[0]))
+
+class ModelWithEmbedding(torch.nn.Module):
+    """
+    Model with embedding module
+    """
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, *inputs):
+        return self.embedding(inputs[0])
+
 class SingleResidual(nn.Module):
     """ A model with a single residual connection.
         Use this model for unit testing purposes. """
@@ -1206,3 +1263,81 @@ class ModelWithModuleList(torch.nn.Module):
 
     def forward(self, x):
         return self.m[0](x)
+
+
+class ModelWithSplitModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.split = elementwise_ops.Split()
+
+    def forward(self, *inputs):
+        return self.split(inputs[0], 2)
+
+
+class ModelWithReluAfterSplit(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.split_module = ModelWithSplitModule()
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
+        self.relu3 = nn.ReLU()
+
+    def forward(self, *inputs):
+        chunks = self.split_module(inputs[0])
+        return self.relu1(chunks[0]), self.relu2(chunks[1]), self.relu3(chunks[2])
+
+
+class ModuleList(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(256, 256) for _ in range(3))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = torch.nn.functional.relu(layer(x)) if i < 3 - 1 else layer(x)
+        return x
+
+
+class ModelWithReusedInitializers(torch.nn.Module):
+    def __init__(self, repetition):
+        super(ModelWithReusedInitializers, self).__init__()
+        self.modulelist = ModuleList()
+        self.repetition = repetition
+
+    def forward(self, x):
+        for i in range(self.repetition):
+            x = self.modulelist(x)
+        return x
+
+
+class TinyModelWithNoMathInvariantOps(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=2, padding=2, bias=False)
+        self.mul1 = elementwise_ops.Multiply()
+        self.mul2 = elementwise_ops.Multiply()
+        self.add1 = elementwise_ops.Add()
+
+    def forward(self, x):
+        conv_output = self.conv1(x)
+        y = self.mul1(conv_output, 2)
+        m = self.add1(y, 3)
+        z = self.mul2(m, 5)
+        return z
+
+
+class ModelWithThreeLinears(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = nn.Linear(768, 768)
+        self.linear2 = nn.Linear(768, 3072)
+        self.linear3 = nn.Linear(3072, 768)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, *inputs):
+        x = inputs[0]
+        x = self.linear1(x)
+        x = self.linear2(x)
+        x = self.linear3(x)
+        x = self.softmax(x)
+        return x

@@ -254,12 +254,23 @@ if [ $run_prep -eq 1 ]; then
     ## wget -N https://download.pytorch.org/models/resnet18-5c106cde.pth -P ${AIMET_TORCH_HOME}/checkpoints
     ## wget -N https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth -P ${AIMET_TORCH_HOME}/checkpoints
 
+    github_url="https://github.com"
+    if [[ ${GITHUB_MIRROR_URL} ]]; then
+        github_url=${GITHUB_MIRROR_URL}
+        export GIT_SSH_COMMAND='ssh -i /tmp/.ssh/id_rsa -o "StrictHostKeyChecking=no"'
+    fi
+    echo -e "Using ${github_url} for public repos..."
+
     # Clone the google test repo if not already present
-    google_test_path="${workspaceFolder}/ThirdParty/googletest/googletest-release-1.8.0"
+    google_test_path="${workspaceFolder}/ThirdParty/google/googletest-release-1.12.1"
     if [ ! -e ${google_test_path} ]; then
-        mkdir -p $workspaceFolder/ThirdParty/googletest
-        pushd $workspaceFolder/ThirdParty/googletest
-        git clone https://github.com/google/googletest.git -b release-1.8.0 googletest-release-1.8.0
+        mkdir -p $workspaceFolder/ThirdParty/google
+        pushd $workspaceFolder/ThirdParty/google
+        if [[ -f "${DEPENDENCY_DATA_PATH}/googletest.zip" ]]; then
+            unzip ${DEPENDENCY_DATA_PATH}/googletest.zip
+        else
+            git clone ${github_url}/google/googletest.git -b release-1.12.1 googletest-release-1.12.1
+        fi
         popd
         check_stage $? "Preparation" "true"
     fi

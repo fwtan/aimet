@@ -40,6 +40,7 @@ import json
 import os
 import torch
 import numpy as np
+from aimet_common.connected_graph.connectedgraph_utils import CG_SPLIT
 from aimet_common.defs import QuantScheme, QuantizationDataType, QuantDtypeBwInfo, SupportedKernelsAction
 from models.test_models import SingleResidual, QuantSimTinyModel, MultiInput, SingleResidualWithModuleAdd, \
     SingleResidualWithAvgPool
@@ -52,6 +53,7 @@ from aimet_torch import utils
 from aimet_torch.meta.connectedgraph import ConnectedGraph
 from aimet_torch.tensor_quantizer import StaticGridPerTensorQuantizer, StaticGridPerChannelQuantizer
 from aimet_torch.elementwise_ops import Add
+from models import test_models
 
 class ModelWithBertCustomLayerNormGelu(torch.nn.Module):
     """ Model with PyTorch LayerNorm and gelu """
@@ -787,15 +789,15 @@ class TestQuantsimConfig:
         with open('./data/quantsim_config.json', 'w') as f:
             json.dump(quantsim_config, f)
 
-        aimet_torch.quantsim.SUPPORTED_KERNELS_ACTION = SupportedKernelsAction.assert_on_error
-
-        with pytest.raises(RuntimeError):
-            QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
-                                   config_file='./data/quantsim_config.json',
-                                   dummy_input=torch.rand(1, 3, 32, 32), default_param_bw=16, default_output_bw=8,
-                                   default_data_type=QuantizationDataType.int)
-
-        aimet_torch.quantsim.SUPPORTED_KERNELS_ACTION = SupportedKernelsAction.warn_on_error
+        try:
+            aimet_torch.quantsim.SUPPORTED_KERNELS_ACTION = SupportedKernelsAction.assert_on_error
+            with pytest.raises(RuntimeError):
+                QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                       config_file='./data/quantsim_config.json',
+                                       dummy_input=torch.rand(1, 3, 32, 32), default_param_bw=16, default_output_bw=8,
+                                       default_data_type=QuantizationDataType.int)
+        finally:
+            aimet_torch.quantsim.SUPPORTED_KERNELS_ACTION = SupportedKernelsAction.warn_on_error
 
     def test_parse_config_file_supergroups(self):
         """ Test that supergroup quantization parameters are set correctly when using json config file """
@@ -957,6 +959,7 @@ class TestQuantsimConfig:
                 elif name == 'add2':
                     assert not module.input_quantizers[0].enabled
                     assert module.input_quantizers[1].enabled
+                    assert module.input_quantizers[1].is_const
                 else:
                     assert not module.input_quantizers[0].enabled
                 assert not module.output_quantizers[0].enabled
@@ -1133,7 +1136,7 @@ class TestQuantsimConfig:
         conn_graph = ConnectedGraph(model, random_inputs)
         starting_op = conn_graph.get_op_from_module_name('SingleResidual.conv3')
         add_op = [op for op in conn_graph.get_all_ops().values() if op.type == 'Add'][0]
-        neighborhood = get_all_ops_in_neighborhood(starting_op, 'output')
+        neighborhood = get_all_ops_in_neighborhood(starting_op, 'output', split_type=CG_SPLIT)
         assert len(neighborhood) == 2
         assert starting_op in neighborhood
         assert add_op in neighborhood
@@ -2203,3 +2206,37 @@ class TestQuantsimConfig:
                 assert qsim.model.softmax.output_quantizers[0].quant_scheme == QuantScheme.post_training_tf
                 assert np.allclose(qsim.model.softmax.output_quantizers[0].encoding.min, -5.0, atol=1e-1)
                 assert np.allclose(qsim.model.softmax.output_quantizers[0].encoding.max, 5.0, atol=1e-1)
+
+    def test_load_and_freeze_with_partial_encodings(self):
+        """ Test load_and_freeze encoding API with partial_encodings """
+        model = test_models.TinyModelWithNoMathInvariantOps()
+        dummy_input = torch.randn([1, 3, 24, 24])
+
+        sample_encoding = {"min": -4, "max": 4, "scale": 0.03, "offset": 8,
+                           "bitwidth": 8, "is_symmetric": "False", "dtype": "int"}
+
+        sample_partial_encodings_list = [{"activation_encodings": {"conv1": {"input": {"0": sample_encoding}},
+                                                                   "mul1": {"output": {"0": sample_encoding}}},
+                                          "param_encodings": {}},
+                                         {"activation_encodings": {"add1": {"output": {"0": sample_encoding}}},
+                                          "param_encodings": {}},
+                                         {"activation_encodings": {"mul1": {"output": {"0": sample_encoding}}},
+                                          "param_encodings": {"conv1.weight": [sample_encoding]}}]
+
+        for partial_encodings in sample_partial_encodings_list:
+            with open('./data/partial_encoding.json', 'w') as f:
+                json.dump(partial_encodings, f)
+
+            sim = QuantizationSimModel(model, dummy_input, quant_scheme=QuantScheme.post_training_tf)
+
+            sim.load_and_freeze_encodings('./data/partial_encoding.json', ignore_when_quantizer_disabled=True)
+
+            # all output quantizers and model input quantizer need to enabled (no op specific config)
+            assert sim.model.mul1.output_quantizers[0].enabled
+            assert sim.model.mul2.output_quantizers[0].enabled
+            assert sim.model.add1.output_quantizers[0].enabled
+            assert sim.model.conv1.output_quantizers[0].enabled
+            assert sim.model.conv1.input_quantizers[0].enabled
+
+            # conv param quantizer needs to be enabled
+            assert sim.model.conv1.param_quantizers['weight'].enabled
