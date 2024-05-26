@@ -44,7 +44,7 @@ from onnx import numpy_helper
 import torch
 import torch.nn.functional as functional
 from torch.utils.data import Dataset
-from packaging import version
+from packaging import version  # pylint: disable=wrong-import-order
 
 # Import AIMET specific modules
 from aimet_common.utils import AimetLogger
@@ -150,12 +150,12 @@ class AdaroundOptimizer:
         inp_data, out_data = act_sampler.sample_acts(create_input_dict(orig_model.model, model_inputs))
         inp_data_torch, out_data_torch = torch.from_numpy(inp_data[0]), torch.from_numpy(out_data[0])
         use_cache_acts_data = TorchAdaroundOptimizer._can_cache_acts_data(len(cached_dataset), inp_data_torch.shape,
-                                                                          out_data_torch.shape)
+                                                                          out_data_torch.shape, inp_data_torch.dtype)
 
         attributes = read_attributes_for_op(module)
         if 'pads' in attributes:
-            if len(attributes['pads']) > 2:
-                logger.info("Skipping the Convolution layer because padding size greater than 2 is not supported for optimization")
+            if len(attributes['pads']) > 4:
+                logger.info("Skipping the Convolution layer because padding size greater than 4 is not supported for optimization")
                 return
 
         if use_cache_acts_data and AdaroundOptimizer.enable_caching_acts_data():
@@ -271,20 +271,28 @@ class AdaroundOptimizer:
 
         if quant_module.type == 'Conv':
             attributes = read_attributes_for_op(quant_module)
+            if attributes['pads']:
+                onnx_padding = attributes['pads']
+                torch_padding = [onnx_padding[1], onnx_padding[3], onnx_padding[0], onnx_padding[2]]
+                # Takes care of asymmetric padding within a spatial axis
+                inp_data = functional.pad(inp_data, pad=torch_padding)
             bias = None
             if 'bias' in quant_module.params:
                 bias = torch.from_numpy(numpy_helper.to_array(quant_module.params['bias'].tensor)).to(device)
             out_data = functional.conv2d(inp_data, adarounded_weights, bias=bias, stride=attributes['strides'],
-                                         dilation=attributes['dilations'], padding=attributes['pads'],
-                                         groups=attributes['group'])
+                                         dilation=attributes['dilations'], groups=attributes['group'])
         elif quant_module.type == 'ConvTranspose':
             attributes = read_attributes_for_op(quant_module)
+            if attributes['pads']:
+                onnx_padding = attributes['pads']
+                torch_padding = [onnx_padding[1], onnx_padding[3], onnx_padding[0], onnx_padding[2]]
+                # Takes care of asymmetric padding within a spatial axis
+                inp_data = functional.pad(inp_data, pad=torch_padding)
             bias = None
             if 'bias' in quant_module.params:
                 bias = torch.from_numpy(numpy_helper.to_array(quant_module.params['bias'].tensor)).to(device)
             out_data = functional.conv_transpose2d(inp_data, adarounded_weights, bias=bias, stride=attributes['strides'],
-                                                   dilation=attributes['dilations'], padding=attributes['pads'],
-                                                   groups=attributes['group'])
+                                                   dilation=attributes['dilations'], groups=attributes['group'])
         elif quant_module.type in ['Gemm', 'MatMul']:
             bias = torch.from_numpy(numpy_helper.to_array(quant_module.params['bias'].tensor)).to(device)
             out_data = functional.linear(inp_data, adarounded_weights, bias=bias)
@@ -322,5 +330,5 @@ def update_sim_weight(quant_model: onnx.ModelProto, weights: onnx.TensorProto, w
     for tensor in quant_model.model.graph.initializer:
         if tensor.name == weight_name:
             tensor.raw_data = weights
-            break
-    assert "Could not find %s in QuantSim model", weight_name
+            return
+    logger.info("Could not find %s in QuantSim model", weight_name)

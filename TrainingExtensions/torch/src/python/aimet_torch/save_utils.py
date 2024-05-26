@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2017-2018, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2017-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -37,7 +37,7 @@
 
 """ Utilities to save a models and related parameters """
 
-from aimet_torch.qc_quantize_op import QcQuantizeWrapper
+from aimet_torch.quantsim import ExportableQuantModule
 
 
 class SaveUtils:
@@ -50,9 +50,8 @@ class SaveUtils:
         :param module: Model
         """
         for module_name, module_ref in module.named_children():
-            if isinstance(module_ref, QcQuantizeWrapper):
-                #
-                setattr(module, module_name, module_ref._module_to_wrap)  # pylint: disable=protected-access
+            if isinstance(module_ref, ExportableQuantModule):
+                setattr(module, module_name, module_ref.get_original_module())
             # recursively call children modules
             else:
                 SaveUtils.remove_quantization_wrappers(module_ref)

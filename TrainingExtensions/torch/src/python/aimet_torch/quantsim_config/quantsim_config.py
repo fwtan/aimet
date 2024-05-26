@@ -39,6 +39,7 @@ import copy
 from abc import abstractmethod
 from typing import Dict, List, Tuple, Set, Union
 import torch
+from torch.nn.modules import ConvTranspose2d
 
 from aimet_common.utils import AimetLogger, log_with_error_and_assert_if_false
 from aimet_common.graph_searcher import GraphSearcher
@@ -57,7 +58,7 @@ from aimet_torch.tensor_quantizer import TensorQuantizer
 from aimet_torch.meta.connectedgraph import ConnectedGraph
 from aimet_torch.onnx_utils import map_torch_types_to_onnx, pytorch_functional_name_to_onnx_dict
 from aimet_torch.translation_mapping import aimet_op_to_backend_op_name_map
-from aimet_torch.experimental.v2.quantization.wrappers.builder import LazyQuantizeWrapper
+from aimet_torch.v2.quantization.builder import LazyQuantizeWrapper
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 MAP_PYTORCH_PARAM_NAME_TO_QUANTSIM_NAME = {
@@ -220,7 +221,7 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
             while queue:
                 current_op = queue.pop()
                 if current_op.output:
-                    output_ops = [consumer for consumer in current_op.output.consumers]
+                    output_ops = [consumer for consumer in current_op.output.consumers]  # pylint: disable=unnecessary-comprehension
                     for output_op in output_ops:
                         if output_op.get_module() is not None and output_op.get_module() in \
                                 self._module_to_quantsim_wrapper_dict:
@@ -486,7 +487,6 @@ class QuantSimConfigurator(AimetCommonQuantSimConfigurator):
             conv_bn_pairs = []
 
             def handler(_, op_list):
-                from torch.nn.modules import ConvTranspose2d
                 conv, bn = op_list
                 conv_module = conv.get_module()
                 # Transposed depthwise convolutions are not supported for batchnorm folding

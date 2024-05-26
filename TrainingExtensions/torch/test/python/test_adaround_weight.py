@@ -49,8 +49,7 @@ from torchvision import models
 from aimet_common.utils import AimetLogger
 from aimet_common.defs import QuantScheme
 from aimet_common.quantsim import calculate_delta_offset
-from aimet_torch.tensor_quantizer import StaticGridTensorQuantizer
-from aimet_torch.adaround.adaround_tensor_quantizer import AdaroundTensorQuantizer
+from aimet_torch.adaround.adaround_wrapper import AdaroundWrapper
 from aimet_torch.utils import create_fake_data_loader, create_rand_tensors_given_shapes, get_device
 from models.test_models import TinyModel
 from aimet_torch.quantsim import QuantizationSimModel
@@ -59,6 +58,17 @@ from aimet_torch.adaround.adaround_weight import Adaround, AdaroundOptimizer, Ad
 
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Test)
+
+
+@pytest.fixture
+def disable_activation_caching():
+    # Disable caching activation data
+    orig_flag = AdaroundOptimizer.is_activation_caching_enabled
+    try:
+        AdaroundOptimizer.is_activation_caching_enabled = False
+        yield
+    finally:
+        AdaroundOptimizer.is_activation_caching_enabled = orig_flag
 
 
 def dummy_forward_pass(model, inp_shape):
@@ -122,6 +132,22 @@ class ConvTransposeNet(torch.nn.Module):
         x = self.bn1(x)
         x = self.reul1(x)
 
+        return x
+
+
+class ConvWithStandaloneBN(torch.nn.Module):
+    """" Model with Conv and Standalone BatchNorm layer """
+    def __init__(self):
+        super(ConvWithStandaloneBN, self).__init__()
+        self.conv1 = torch.nn.Conv2d(3, 8, kernel_size=2, stride=2, padding=2, bias=False)
+        self.bn1 = torch.nn.BatchNorm2d(8)
+        self.reul1 = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = x + 2
+        x = self.bn1(x)
+        x = self.reul1(x)
         return x
 
 
@@ -215,26 +241,47 @@ class SplittableModel(torch.nn.Module):
         x = self.fc(x)
         return x
 
-
-def save_config_file_for_checkpoints():
-    checkpoints_config = {
-        "grouped_modules": {
-            "0": ["conv1", "bn1", "relu1", "maxpool"],
-            "1": ["conv2", "bn2", "relu2"],
-            "2": ["conv3", "relu3", "avgpool"],
-            "3": ["conv4", "flatten", "fc"],
-        },
-        "include_static_inputs": [
-            "False",
-            "False",
-            "False",
-            "False"
-        ],
-        "cache_on_cpu": "False"
-    }
-
-    with open('./test_checkpoints.json', 'w') as f:
+def save_config_file_for_checkpoints(checkpoints_config, config_file):
+    with open(config_file, 'w') as f:
         json.dump(checkpoints_config, f)
+
+
+class TwoConvModel(torch.nn.Module):
+    """ Use this model for unit testing purposes. Expect input shape (1, 3, 32, 32) """
+
+    def __init__(self):
+        super(TwoConvModel, self).__init__()
+        self.conv1 = torch.nn.Conv2d(4, 4, kernel_size=1, bias=False)
+        self.relu = torch.nn.ReLU(inplace=True)
+        self.conv2 = torch.nn.Conv2d(4, 4, kernel_size=1, bias=False)
+
+    def forward(self, *inputs):
+        #return self.conv1(inputs[0])
+        #return self.relu(self.conv1(inputs[0]))
+        x = self.conv1(inputs[0])
+        x =  self.relu(x)
+        return self.conv2(x)
+
+
+class MultiBlockModel(torch.nn.Module):
+    """ Use this model for unit testing purposes. Expect input shape (1, 3, 32, 32) """
+
+    def __init__(self):
+        super(MultiBlockModel, self).__init__()
+        self.conv1 = torch.nn.Conv2d(3, 4, kernel_size=1, bias=False)
+        self.block1 = TwoConvModel()
+        self.conv2 = torch.nn.Conv2d(4, 4, kernel_size=1, bias=False)
+        self.relu = torch.nn.ReLU(inplace=True)
+        self.block2 = TwoConvModel()
+        self.conv3 = torch.nn.Conv2d(4, 4, kernel_size=1, bias=False)
+
+    def forward(self, *inputs):
+        x = self.conv1(inputs[0])
+        x = self.block1(x)
+        x = self.conv2(x)
+        x = self.relu(x)
+        x = self.block2(x)
+        return self.conv3(x)
 
 class TestAdaround:
     """
@@ -244,7 +291,7 @@ class TestAdaround:
     def test_apply_adaround(self):
         """ test apply_adaround end to end using tiny model """
         torch.manual_seed(10)
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -266,6 +313,7 @@ class TestAdaround:
         # Test export functionality
         with open('./dummy.encodings') as json_file:
             encoding_data = json.load(json_file)
+            encoding_data = encoding_data['param_encodings']
             print(encoding_data)
 
         param_keys = list(encoding_data.keys())
@@ -294,10 +342,26 @@ class TestAdaround:
 
         params = AdaroundParameters(data_loader=data_loader, num_batches=1, default_num_iterations=5,
                                     forward_fn=dummy_fwd)
-        save_config_file_for_checkpoints()
+        checkpoints_config = {
+            "grouped_modules": {
+                "0": ["conv1", "bn1", "relu1", "maxpool"],
+                "1": ["conv2", "bn2", "relu2"],
+                "2": ["conv3", "relu3", "avgpool"],
+                "3": ["conv4", "flatten", "fc"],
+            },
+            "include_static_inputs": [
+                "False",
+                "False",
+                "False",
+                "False"
+            ],
+            "cache_on_cpu": "False"
+        }
+        config_file = "./test_checkpoints.json"
+        save_config_file_for_checkpoints(checkpoints_config, config_file)
         ada_rounded_model = Adaround.apply_adaround(model, inp_tensor_list, params, './', 'dummy')
         ada_rounded_model_ckpts = Adaround.apply_adaround_with_cache(model, inp_tensor_list, params, './', 'dummy_checkpoints',
-                                                                     checkpoints_config="./test_checkpoints.json")
+                                                                     checkpoints_config=config_file)
 
         for (name, param), (name_ckpts, param_ckpts) in zip(ada_rounded_model.named_parameters(),
                                                             ada_rounded_model_ckpts.named_parameters()):
@@ -307,10 +371,76 @@ class TestAdaround:
         # Test export functionality
         with open('./dummy.encodings') as json_file:
             encoding_data = json.load(json_file)
+            encoding_data = encoding_data['param_encodings']
             print(encoding_data)
 
         with open('./dummy_checkpoints.encodings') as json_file:
             encoding_data_ckpts = json.load(json_file)
+            encoding_data_ckpts = encoding_data_ckpts['param_encodings']
+            print(encoding_data_ckpts)
+
+        assert list(encoding_data.keys()) == list(encoding_data_ckpts.keys())
+
+        for key in list(encoding_data.keys()):
+            enc = encoding_data[key][0]
+            enc_ckpts = encoding_data_ckpts[key][0]
+            assert list(enc.keys()) == list(enc_ckpts.keys())
+            # Check all encodings are match
+            for k in list(enc.keys()):
+                assert enc[k] == enc_ckpts[k]
+
+        # Delete encodings files and checkpoint config json file
+        if os.path.exists("./dummy.encodings"):
+            os.remove("./dummy.encodings")
+        if os.path.exists("./dummy_checkpoints.encodings"):
+            os.remove("./dummy_checkpoints.encodings")
+        if os.path.exists("./test_checkpoints.json"):
+            os.remove("./test_checkpoints.json")
+
+    def test_adaround_with_disjoint_checkpoints_config(self):
+        """ Test disjoint checkpoint for two blocks model """
+        def dummy_fwd(model, inputs):
+            return model(*inputs) if isinstance(inputs, (list, tuple)) else model(inputs)
+        torch.manual_seed(10)
+
+        # create fake data loader with image size (3, 32, 32)
+        data_loader = create_fake_data_loader(dataset_size=1, batch_size=1, image_size=(3, 32, 32))
+
+        net = MultiBlockModel().eval()
+        model = net.to(torch.device('cpu'))
+
+        input_shape = (1, 3, 32, 32)
+
+        inp_tensor_list = create_rand_tensors_given_shapes(input_shape, get_device(model))
+
+        params = AdaroundParameters(data_loader=data_loader, num_batches=1, default_num_iterations=5,
+                                    forward_fn=dummy_fwd)
+        checkpoints_config = {
+            "checkpoint_type": "disjoint",
+            "cached_blocks": [
+                "block1",
+                "block2"
+            ],
+            "cache_on_cpu": "False"
+        }
+        config_file ='./disjoint_checkpoints.json'
+        save_config_file_for_checkpoints(checkpoints_config, config_file)
+        ada_rounded_model = Adaround.apply_adaround(model, inp_tensor_list, params, './', 'dummy')
+        ada_rounded_model_ckpts = Adaround.apply_adaround_with_cache(model, inp_tensor_list, params, './', 'dummy_checkpoints',
+                                                                     checkpoints_config=config_file)
+
+        for (name, param), (name_ckpts, param_ckpts) in zip(ada_rounded_model.named_parameters(),
+                                                            ada_rounded_model_ckpts.named_parameters()):
+            assert name == name_ckpts
+            assert torch.equal(param, param_ckpts)
+
+        # Test export functionality
+        with open('./dummy.encodings') as json_file:
+            encoding_data = json.load(json_file)['param_encodings']
+            print(encoding_data)
+
+        with open('./dummy_checkpoints.encodings') as json_file:
+            encoding_data_ckpts = json.load(json_file)['param_encodings']
             print(encoding_data_ckpts)
 
         assert list(encoding_data.keys()) == list(encoding_data_ckpts.keys())
@@ -334,7 +464,7 @@ class TestAdaround:
     def test_apply_adaround_per_channel(self):
         """ test apply_adaround end to end using tiny model when using per-channel mode """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -382,6 +512,7 @@ class TestAdaround:
         # Test export functionality
         with open('./dummy.encodings') as json_file:
             encoding_data = json.load(json_file)
+            encoding_data = encoding_data['param_encodings']
             print(encoding_data)
 
         param_keys = list(encoding_data.keys())
@@ -424,7 +555,8 @@ class TestAdaround:
         out_rounding_to_nearest = quant_module(dummy_input)
 
         # replace the tensor quantizer
-        Adaround._replace_tensor_quantizer(quant_module)  # pylint: disable=protected-access
+        Adaround._replace_quantization_layer(sim.model, 'conv1')  # pylint: disable=protected-access
+        quant_module = sim.model.conv1
         out_soft_quant = quant_module(dummy_input)
 
         soft_quant_rec = functional.mse_loss(out_soft_quant, out_float32)
@@ -432,7 +564,7 @@ class TestAdaround:
         assert soft_quant_rec < 1
 
         # enable hard rounding
-        quant_module.param_quantizers['weight'].use_soft_rounding = False
+        quant_module.use_soft_rounding = False
         out_hard_quant = quant_module(dummy_input)
         hard_quant_rec = functional.mse_loss(out_hard_quant, out_rounding_to_nearest)
 
@@ -441,7 +573,7 @@ class TestAdaround:
 
     def test_adaround_conv_only_model_weight_binning(self):
         """ test AdaRound weight binning """
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -474,7 +606,7 @@ class TestAdaround:
 
     def test_unused_module_model(self):
         """ test AdaRound weight binning """
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -511,7 +643,7 @@ class TestAdaround:
 
     def test_out_of_sequence_module_model(self):
         """ test  out of sequence modules """
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -547,7 +679,7 @@ class TestAdaround:
     def test_conv_transpose_2d_model(self):
         """ test a model that has a ConveTranspose2d module """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 24, 24))
@@ -590,7 +722,7 @@ class TestAdaround:
     def test_conv_transpose_2d_model_per_channel(self):
         """ test a model that has a ConvTranspose2d module in per channel mode """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 24, 24))
@@ -618,7 +750,7 @@ class TestAdaround:
         _ = ada_model(*inp_tensor_list)
 
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
 
         assert len(encoding_data['trans_conv1.weight']) == 2
 
@@ -633,7 +765,7 @@ class TestAdaround:
     def test_overriding_default_parameter_bitwidths(self):
         """ Override the default parameter bitwidths for a model """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -655,7 +787,7 @@ class TestAdaround:
 
         # Read exported param encodings JSON file
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
 
         # Verify Conv2 weight encoding bitwidth is set to 8
         conv2_encoding = encoding_data["conv2.weight"][0]
@@ -672,7 +804,7 @@ class TestAdaround:
     def test_overriding_default_parameter_bitwidths_with_empty_list(self):
         """ Override the default parameter bitwidths for a model """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -693,7 +825,7 @@ class TestAdaround:
 
         # Read exported param encodings JSON file
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
 
         # Verify Conv2 weight encoding bitwidth is set to the default value of 4
         conv2_encoding = encoding_data["conv2.weight"][0]
@@ -741,7 +873,7 @@ class TestAdaround:
     def test_apply_adaround_with_ignore_list(self):
         """ Test the apply_adaround() API with ignore list """
 
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -764,7 +896,7 @@ class TestAdaround:
 
         # Read exported param encodings JSON file
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
 
         # Verify Conv2 weight encoding bitwidth is set to the default value of 4
         conv2_encoding = encoding_data["conv2.weight"][0]
@@ -829,7 +961,7 @@ class TestAdaround:
 
         # Read exported param encodings JSON file
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
 
         # Verify Conv2 weight encoding bitwidth is set to the default value of 4
         conv2_encoding = encoding_data["conv2.weight"][0]
@@ -844,7 +976,7 @@ class TestAdaround:
     def test_apply_adaround_using_gpu(self, dtype):
         """ test apply_adaround end to end using tiny model """
         torch.manual_seed(10)
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -865,7 +997,7 @@ class TestAdaround:
 
         # Test export functionality
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
             print(encoding_data)
 
         param_keys = list(encoding_data.keys())
@@ -879,20 +1011,10 @@ class TestAdaround:
 
     @pytest.mark.cuda
     @pytest.mark.parametrize('dtype', [torch.float, torch.half])
-    def test_apply_adaround_using_gpu_caching_disabled(self, dtype):
+    def test_apply_adaround_using_gpu_caching_disabled(self, dtype, disable_activation_caching):
         """ test apply_adaround end to end using tiny model """
         torch.manual_seed(10)
-        AimetLogger.set_level_for_all_areas(logging.DEBUG)
-
-        # Disable caching activation data
-        from aimet_torch.adaround.adaround_optimizer import AdaroundOptimizer
-        def enable_caching_acts_data() -> bool:
-            """
-            Function to enable/disable caching intermediate activation data.
-            """
-            return False
-
-        AdaroundOptimizer.enable_caching_acts_data = enable_caching_acts_data
+        AimetLogger.set_level_for_all_areas(logging.INFO)
 
         # create fake data loader with image size (3, 32, 32)
         data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
@@ -913,7 +1035,7 @@ class TestAdaround:
 
         # Test export functionality
         with open('./dummy.encodings') as json_file:
-            encoding_data = json.load(json_file)
+            encoding_data = json.load(json_file)['param_encodings']
             print(encoding_data)
 
         param_keys = list(encoding_data.keys())
@@ -937,7 +1059,7 @@ class TestAdaround:
                                         ignore_quant_ops_list=[model.layer1, model.layer2, model.layer3,
                                                                model.layer4, model.fc])
             with open('./resnet18.encodings') as json_file:
-                encoding_data = json.load(json_file)
+                encoding_data = json.load(json_file)['param_encodings']
 
             assert len(encoding_data) == 1 # Only model.conv1 layer is adarounded.
         finally:
@@ -982,23 +1104,47 @@ class TestAdaround:
         adaround_module = AdaroundOptimizer.adaround_module
 
         def _adaround_module(module, wrapper, model, sim_model, *args, **kwargs):
-            # Assert all the weight quantizers are StaticGridTensorQuantizer
-            # except for the quant wrapper that is currently being optimized
+            # Assert all the wrappers are QcQuantizeWrapper
+            # except for the wrapper that is currently being optimized
             for module_ in sim_model.modules():
-                if not isinstance(module_, QcQuantizeWrapper):
-                    continue
-
-                if 'weight' not in module_.param_quantizers:
+                if not isinstance(module_, (QcQuantizeWrapper, AdaroundWrapper)):
                     continue
 
                 if module_ is wrapper:
-                    expected_weight_quantizer_cls = AdaroundTensorQuantizer
+                    expected_weight_quantizer_cls = AdaroundWrapper
                 else:
-                    expected_weight_quantizer_cls = StaticGridTensorQuantizer
+                    expected_weight_quantizer_cls = QcQuantizeWrapper
 
-                assert isinstance(module_.param_quantizers['weight'], expected_weight_quantizer_cls)
+                assert isinstance(module_, expected_weight_quantizer_cls)
 
             return adaround_module(module, wrapper, model, sim_model, *args, **kwargs)
 
         with patch.object(AdaroundOptimizer, 'adaround_module', _adaround_module):
             _ = Adaround.apply_adaround(model, torch.randn((1, 3, 32, 32)), params, './', 'dummy')
+
+
+    def test_adaround_with_unsupported_modules_containing_weights(self):
+        data_loader = create_fake_data_loader(dataset_size=64, batch_size=16, image_size=(3, 32, 32))
+
+        model = ConvWithStandaloneBN()
+        dummy_input = torch.randn(1, 3, 32, 32)
+
+        model.eval()
+
+        adaround_params = AdaroundParameters(data_loader=data_loader, num_batches=4, default_num_iterations=5)
+        ada_model = Adaround.apply_adaround(model, dummy_input, adaround_params,
+                                            path='./data', filename_prefix='conv_with_standalone_bn_ada')
+
+        sim = QuantizationSimModel(ada_model, dummy_input)
+        sim.set_and_freeze_param_encodings('./data/conv_with_standalone_bn_ada.encodings')
+
+        for _, module in sim.model.named_modules():
+            if isinstance(module, QcQuantizeWrapper) and 'weight' in module.param_quantizers:
+                # As adaround doesn't support standalone batchnorm modules (which are not folded with Conv),
+                # after applying set_and_freeze_encodings() using adaround encodings,
+                # param quantizers for batchnorm weights should not be disabled
+                if isinstance(module._module_to_wrap, torch.nn.BatchNorm2d):
+                    assert not module.param_quantizers['weight'].is_encoding_frozen and module.param_quantizers['weight'].enabled
+                else:
+                    assert module.param_quantizers['weight'].is_encoding_frozen
+

@@ -45,6 +45,7 @@ import torch
 import torch.nn
 import torchvision
 import torch.nn.functional as F
+import tempfile
 
 import aimet_torch.model_validator.validation_checks
 import aimet_torch.utils
@@ -491,7 +492,7 @@ class TestTrainingExtensionsUtils(unittest.TestCase):
         """
         Test in_eval_mode functionality for given model
         """
-        model = TinyModel().eval()
+        model = TinyModel()
         model_input = torch.randn(1, 3, 32, 32)
         #1 model in eval mode in the beginning
         model.eval()
@@ -518,11 +519,24 @@ class TestTrainingExtensionsUtils(unittest.TestCase):
             pass
         _assert_mode_recursive(model, training=True)
 
+        #4 One of the submodules are set to different mode
+        model.train()
+        model.fc.add_module('submodule', torch.nn.Identity())
+        model.fc.submodule.eval()
+        with utils.in_eval_mode(model):
+            model(model_input)
+            _assert_mode_recursive(model, training=False)
+        for module in model.modules():
+            if module is model.fc.submodule:
+                assert not module.training
+            else:
+                assert module.training
+
     def test_model_in_train_mode(self):
         """
         Test in_train_mode functionality for given model
         """
-        model = TinyModel().eval()
+        model = TinyModel()
         model_input = torch.randn(1, 3, 32, 32)
         #1 model in eval mode in the beginning
         model.eval()
@@ -548,6 +562,19 @@ class TestTrainingExtensionsUtils(unittest.TestCase):
         except:
             pass
         _assert_mode_recursive(model, training=False)
+
+        #4 One of the submodules are set to different mode
+        model.eval()
+        model.fc.add_module('submodule', torch.nn.Identity())
+        model.fc.submodule.train()
+        with utils.in_train_mode(model):
+            model(model_input)
+            _assert_mode_recursive(model, training=True)
+        for module in model.modules():
+            if module is model.fc.submodule:
+                assert module.training
+            else:
+                assert not module.training
 
     def test_is_torch_module(self):
         """ test _is_torch_nn_module() utility """
@@ -707,6 +734,40 @@ class MiniModel(torch.nn.Module):
         for quantizer in all_quantizers:
             assert not quantizer.enabled
 
+
 def _assert_mode_recursive(root: torch.nn.Module, training: bool):
     for module in root.modules():
         assert module.training == training
+
+
+def test_profile():
+    from aimet_common.utils import AimetLogger
+    logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path_and_name = os.path.join(tmpdir, 'temp_profile.txt')
+        with utils.profile('profile 1', file_path_and_name, new_file=True, logger=logger):
+            _ = 1 + 1
+        with utils.profile('profile 2', file_path_and_name, logger=logger):
+            _ = 1 + 1
+        with open(file_path_and_name, 'r') as f:
+            lines = f.readlines()
+        assert len(lines) == 2
+        assert lines[0].startswith('profile 1: ')
+        assert lines[1].startswith('profile 2: ')
+
+        with utils.profile('profile 3', file_path_and_name, new_file=True, logger=logger):
+            _ = 1 + 1
+
+        @utils.profile('profile 4', file_path_and_name)
+        def foobar():
+            _ = 1 + 1
+
+        foobar()
+        with open(file_path_and_name, 'r') as f:
+            lines = f.readlines()
+        assert len(lines) == 2
+        assert lines[0].startswith('profile 3: ')
+        assert lines[1].startswith('profile 4: ')
+
+        with utils.profile('profile 4'):
+            _ = 1 + 1

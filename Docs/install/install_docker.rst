@@ -45,10 +45,10 @@ This page provides instructions to install AIMET package inside a development do
 Set variant
 ~~~~~~~~~~~
 Set the `<variant_string>` to ONE of the following depending on your desired variant
-    #. For the PyTorch 1.13 GPU variant, use `torch-gpu`
-    #. For the PyTorch 1.13 CPU variant, use `torch-cpu`
-    #. For the PyTorch 1.9 GPU variant, use `torch-gpu-pt19`
-    #. For the PyTorch 1.9 CPU variant, use `torch-cpu-pt19`
+    #. For the PyTorch 2.1 GPU variant, use `torch-gpu`
+    #. For the PyTorch 2.1 CPU variant, use `torch-cpu`
+    #. For the PyTorch 1.13 GPU variant, use `torch-gpu-pt113`
+    #. For the PyTorch 1.13 CPU variant, use `torch-cpu-pt113`
     #. For the TensorFlow GPU variant, use `tf-gpu`
     #. For the TensorFlow CPU variant, use `tf-cpu`
     #. For the ONNX GPU variant, use `onnx-gpu`
@@ -118,14 +118,34 @@ Ensure that a docker named `$docker_container_name` is not already running; othe
 Install AIMET packages
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Go to https://github.com/quic/aimet/releases and identify the release tag of the package you want to install.
+From PyPI
+=========
+
+Aimet Torch GPU can install from pypi through the following method:
+
+Go to https://pypi.org/project/aimet-torch to identify a version you wish to install
+
+    - For PyTorch 1.13 GPU you should use aimet-torch==1.31.1
+    - For Pytorch 2.1.2 GPU you should use aimet-torch >= 1.32.0
+
+.. code-block:: bash
+
+    sudo apt-get install liblapacke -y
+    pip install aimet-torch
+
+
+From Release Package
+====================
+
+Alternatively, we host .whl packages for each release at https://github.com/quic/aimet/releases. Identify the release tag
+of the package you wish to install, then follow the instructions below to install AIMET from the .whl file.
 
 Set the <variant_string> to ONE of the following depending on your desired variant
 
-#. For the PyTorch 1.13 GPU variant, use "torch_gpu"
-#. For the PyTorch 1.13 CPU variant, use "torch_cpu"
-#. For the PyTorch 1.9 GPU variant, use "torch_gpu_pt19"
-#. For the PyTorch 1.9 CPU variant, use "torch_cpu_pt19"
+#. For the PyTorch 2.1 GPU variant, use "torch_gpu"
+#. For the PyTorch 2.1 CPU variant, use "torch_cpu"
+#. For the PyTorch 1.13 GPU variant, use "torch_gpu-pt113"
+#. For the PyTorch 1.13 CPU variant, use "torch_cpu-pt113"
 #. For the TensorFlow GPU variant, use "tf_gpu"
 #. For the TensorFlow CPU variant, use "tf_cpu"
 #. For the ONNX GPU variant, use "onnx_gpu"
@@ -151,27 +171,23 @@ Set the common suffix for the package files as follows:
 
 .. code-block:: bash
 
-    export wheel_file_suffix="cp38-cp38-linux_x86_64.whl"
+    export wheel_file_suffix="cp310-cp310-linux_x86_64.whl"
 
 Install the AIMET packages in the order specified below:
 
 **NOTE:**
     #. Please pre-pend the "apt-get install" and "pip3 install" commands with "sudo -H" as appropriate.
-    #. These instructions assume that pip packages will be installed in the path: /usr/local/lib/python3.8/dist-packages. If that is not the case, please modify it accordingly.
+    #. These instructions assume that pip packages will be installed in the path: /usr/local/lib/python3.10/dist-packages. If that is not the case, please modify it accordingly.
     #. Python dependencies will automatically get installed.
 
 .. code-block:: bash
 
-    python3 -m pip install ${download_url}/AimetCommon-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
-
     # Install ONE of the following depending on the variant
-    python3 -m pip install ${download_url}/AimetTorch-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix} -f https://download.pytorch.org/whl/torch_stable.html
+    python3 -m pip install ${download_url}/aimet_torch-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix} -f https://download.pytorch.org/whl/torch_stable.html
     # OR
-    python3 -m pip install ${download_url}/AimetTensorflow-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
+    python3 -m pip install ${download_url}/aimet_tensorflow-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
     # OR
-    python3 -m pip install ${download_url}/AimetOnnx-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
-
-    python3 -m pip install ${download_url}/Aimet-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
+    python3 -m pip install ${download_url}/aimet_onnx-${AIMET_VARIANT}_${release_tag}-${wheel_file_suffix}
 
 Environment setup
 ~~~~~~~~~~~~~~~~~
@@ -180,5 +196,5 @@ Set the common environment variables as follows:
 
 .. code-block:: bash
 
-    source /usr/local/lib/python3.8/dist-packages/aimet_common/bin/envsetup.sh
+    source /usr/local/lib/python3.10/dist-packages/aimet_common/bin/envsetup.sh
 

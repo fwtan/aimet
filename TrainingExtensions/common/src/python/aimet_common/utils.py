@@ -37,6 +37,8 @@
 """ Utility classes and functions that are used by NightlyTests files as well as
     common to both PyTorch and TensorFlow. """
 
+import sys
+from contextlib import contextmanager
 import json
 import logging
 import logging.config
@@ -48,10 +50,14 @@ import subprocess
 import threading
 import time
 from enum import Enum
-from typing import Callable
-
+from typing import Callable, Dict, List, Optional, TextIO, Union, Any
+import multiprocessing
 import yaml
 from tqdm import tqdm
+from bokeh.server.server import Server
+from bokeh.application import Application
+
+SAVE_TO_YAML = False
 
 try:
     # The build system updates Product, Version and Feature set information in the package_info file.
@@ -133,6 +139,7 @@ class AimetLogger(metaclass=SingletonType):
         ModelPreparer = "ModelPreparer"
         LayerOutputs = 'LayerOutputs'
         QuantAnalyzer = 'QuantAnalyzer'
+        SeqMse = 'SeqMse'
 
     def __init__(self):
         self._logger = logging.getLogger()
@@ -144,7 +151,7 @@ class AimetLogger(metaclass=SingletonType):
         with open(abs_file_path, encoding='utf-8') as logging_configuration_file:
             try:
                 config_dict = json.loads(logging_configuration_file.read())
-            except:
+            except:  # pylint: disable=raise-missing-from
                 raise ValueError("Logging configuration file: default_logging_config.json contains invalid format")
 
         logging.config.dictConfig(config_dict)
@@ -239,7 +246,7 @@ def kill_process_with_name_and_port_number(name: str, port_number: int):
     """ Kill a process that is associated with a port number displayed by the command: ps -x """
 
     logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
-    p = subprocess.Popen(['ps', '-x'], stdout=subprocess.PIPE)
+    p = subprocess.Popen(['ps', '-x'], stdout=subprocess.PIPE)  # pylint: disable=consider-using-with
     out, _ = p.communicate()
 
     for line in out.splitlines():
@@ -258,9 +265,6 @@ def start_bokeh_server_session(port: int = None):
     :param port: Port number. If not specified, bokeh server will listen on an arbitrary free port.
     :return: Returns the Bokeh Server URL and the process object used to create the child server process
     """
-    from bokeh.server.server import Server
-    from bokeh.application import Application
-    import multiprocessing
     manager = multiprocessing.Manager()
     d = manager.dict()
     server_started = manager.Event()
@@ -317,18 +321,20 @@ def log_package_info():
         logging.info("%s", Product)
 
 
-def save_json_yaml(encoding_file_path: str, encodings_dict: dict):
+def save_json_yaml(file_path: str, dict_to_save: dict):
     """
     Function which saves encoding in YAML and JSON file format
-    :param encoding_file_path: file name to use to generate the yaml and json file
-    :param encodings_dict: dictionary containing the encoding
+    :param file_path: file name to use to generate the yaml and json file
+    :param dict_to_save: dictionary to save
     """
-    encoding_file_path_json = encoding_file_path
-    encoding_file_path_yaml = encoding_file_path + '.yaml'
+    encoding_file_path_json = file_path
     with open(encoding_file_path_json, 'w') as encoding_fp_json:
-        json.dump(encodings_dict, encoding_fp_json, sort_keys=True, indent=4)
-    with open(encoding_file_path_yaml, 'w') as encoding_fp_yaml:
-        yaml.dump(encodings_dict, encoding_fp_yaml, default_flow_style=False, allow_unicode=True)
+        json.dump(dict_to_save, encoding_fp_json, sort_keys=True, indent=4)
+
+    if SAVE_TO_YAML:
+        encoding_file_path_yaml = file_path + '.yaml'
+        with open(encoding_file_path_yaml, 'w') as encoding_fp_yaml:
+            yaml.dump(dict_to_save, encoding_fp_yaml, default_flow_style=False, allow_unicode=True)
 
 
 class TqdmStreamHandler(logging.StreamHandler):
@@ -337,7 +343,7 @@ class TqdmStreamHandler(logging.StreamHandler):
     """
     def emit(self, record):
         with tqdm.external_write_mode(file=self.stream):
-            super(TqdmStreamHandler, self).emit(record)
+            super().emit(record)
 
 
 
@@ -399,19 +405,19 @@ class Spinner(tqdm):
             f"{prefix} {title}" for prefix in self.prefixes
         ]
 
-        super(Spinner, self).__init__()
+        super().__init__()
 
     def __str__(self):
         return self._messages[self._index]
 
     def __enter__(self):
         self._refresh_thread.start()
-        return super(Spinner, self).__enter__()
+        return super().__enter__()
 
     def __exit__(self, *args, **kwargs): # pylint: disable=arguments-differ
         self._stop.set()
         self._refresh_thread.join()
-        super(Spinner, self).__exit__(*args, **kwargs)
+        super().__exit__(*args, **kwargs)
 
 
 class Handle:
@@ -432,3 +438,66 @@ class Handle:
 
     def __exit__(self, *_):
         self.remove()
+
+
+def convert_configs_values_to_bool(dictionary: Dict):
+    """
+    Recursively traverse all key value pairs in dictionary and set any string values representing booleans to
+    booleans.
+    :param dictionary: Dictionary to set values to True or False if applicable
+    """
+    for key, value in dictionary.items():
+        if value == 'True':
+            dictionary[key] = True
+        elif value == 'False':
+            dictionary[key] = False
+        elif isinstance(value, List):
+            for item in value:
+                if isinstance(item, Dict):
+                    convert_configs_values_to_bool(item)
+        elif isinstance(value, Dict):
+            convert_configs_values_to_bool(value)
+        else:
+            pass
+
+
+@contextmanager
+def profile(label: str, file: Union[str, os.PathLike, TextIO] = None, new_file: bool = False, logger: Optional[logging.Logger] = None,
+            cleanup: Callable[[], Any] = None):
+    """
+    Profile a block of code and save profiling information into a file.
+
+    :param label: String label associated with the block of code to profile (shows up in the profiling print)
+    :param file: File path and name or a file-like object to send output text to (Default: stdout)
+    :param new_file: True if a new file is to be created to hold profiling info, False if an existing file should be
+        appended to. This flag is only valid when ``file`` is a path, not a file-like object.
+    :param logger: If logger is provided, profiling string will also be printed with INFO logging level
+    :param cleanup: If provided, this will be called before ending profiling. This can be useful for synchronizing cuda streams.
+    """
+    should_close = False
+    if isinstance(file, (str, os.PathLike)):
+        mode = 'w' if new_file else 'a'
+        file = open(file, mode) # pylint: disable=consider-using-with
+        should_close = True
+    elif file is None:
+        file = sys.stdout
+
+    assert hasattr(file, 'write')
+
+    try:
+        with Spinner(label):
+            start = time.perf_counter()
+            yield
+            if cleanup:
+                cleanup()
+            end = time.perf_counter()
+
+        profiling_string = f'{label}: {end - start:.2f}s'
+
+        if logger:
+            logger.info(profiling_string)
+
+        print(profiling_string, file=file)
+    finally:
+        if should_close:
+            file.close()

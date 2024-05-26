@@ -12,7 +12,7 @@ To learn more about this technique, please see :ref:`AutoQuant<ug-auto-quant>`
 
 Examples Notebook Link
 ======================
-For an end-to-end notebook showing how to use PyTorch AutoQuant, please see :doc:`here<../Examples/torch/quantization/autoquant>`.
+For an end-to-end notebook showing how to use PyTorch AutoQuant, please see :doc:`here<../Examples/torch/quantization/autoquant_v2>`.
 
 Top-level API
 =============
@@ -27,7 +27,7 @@ Code Examples
 ===============
 .. literalinclude:: ../torch_code_examples/auto_quant_v2.py
     :language: python
-    :lines: 41-
+    :lines: 40-
     :emphasize-lines: 74-78,86-
 
 .. note::
@@ -35,5 +35,5 @@ Code Examples
 
 .. literalinclude:: ../torch_code_examples/auto_quant.py
     :language: python
-    :lines: 114-
+    :lines: 113-
     :emphasize-lines: 1-4,12-

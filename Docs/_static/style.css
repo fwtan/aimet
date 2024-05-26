@@ -23,11 +23,13 @@ nav .hideitem {
 
 :root {
   --aimet-blue: #3253dc;
-  --aimet-dark-blue: #0000ff
+  --aimet-dark-blue: #0000ff;
   --aimet-white: #ffffff;
   --aimet-border-grey: #e0e0e0;
   --aimet-menu-hover: #e3efff;
   --aimet-menu-font-active: #0058ff;
+  --aimet-code-grey: #fafafa;
+  --aimet-light-blue: #e7f2fa;
 }
 
 /* In main body this sets the background used in the text boxes*/
@@ -222,3 +224,95 @@ padding: .4045em 1.618em;
 .wy-menu-vertical li.toctree-l3, .wy-menu-vertical li.toctree-l4 {
   font-size: 14px;
 }
+
+
+/*
+ * Version selector color configuration
+ */
+.rst-versions {
+    position: sticky;
+    background: var(--aimet-white);
+}
+
+.rst-versions .rst-current-version {
+    text-align: center;
+    background-color: var(--aimet-white);
+    color: black;
+}
+
+.rst-versions .rst-current-version-name {
+    color: var(--aimet-menu-font-active);
+}
+
+.rst-versions .rst-current-version .fa-caret-down {
+    color: black;
+}
+
+.rst-versions .rst-other-versions dd a {
+    color: var(--aimet-menu-font-active)
+}
+
+.rst-versions .rst-other-versions dt {
+    color: black;
+}
+
+/*
+ * Highlight color for code segments
+ */
+.highlight, .literal-block
+{
+    background: var(--aimet-code-grey);
+}
+
+/*
+ * Table options
+*/
+
+/* Use root font size for generated table */
+html.writer-html5 .rst-content table.docutils td>p, html.writer-html5 .rst-content table.docutils th>p {
+    border: 0 solid var(--aimet-border-grey);
+    line-height: 1.5rem;
+    font-size: 1rem;
+}
+
+/* Remove internal bottom borders */
+.rst-content table.docutils td, .wy-table-bordered-all td {
+    border-left-width: 1px;
+    border-bottom-width: 0;
+}
+
+/* Keep outside borders */
+.rst-content table.docutils, .wy-table-bordered-all {
+    border: 1px solid var(--aimet-border-grey);
+}
+
+/* Set text color of side navigation TOC section headers */
+.wy-menu-vertical header, .wy-menu-vertical p.caption {
+    color: var(--aimet-dark-blue);
+}
+
+
+/*
+ * Configure the appearance of code output box.
+ * Values are based on sphinx-gallery configuration
+*/
+.script-output {
+    color: black;
+    display: flex;
+    gap: 0.5em;
+}
+
+.script-output::before {
+    content: "Out:";
+    line-height: 1.4;
+    padding-top: 10px;
+}
+
+.script-output .highlight {
+    background: transparent;
+    flex-grow: 1;
+    overflow: auto;
+    /* Allow output block to take up maximum 25 lines */
+    max-height: 25em;
+}
+

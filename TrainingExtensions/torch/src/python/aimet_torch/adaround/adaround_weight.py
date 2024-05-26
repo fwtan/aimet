@@ -48,20 +48,21 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Import AIMET specific modules
-from aimet_common.utils import AimetLogger
+from aimet_common.utils import AimetLogger, convert_configs_values_to_bool
 from aimet_common.defs import QuantScheme, QuantizationDataType
 
 from aimet_torch import utils
 from aimet_torch.save_utils import SaveUtils
 from aimet_torch.meta import connectedgraph_utils
-from aimet_torch.quantsim import QuantizationSimModel, QcQuantizeWrapper
+from aimet_torch.quantsim import QuantizationSimModel, QcQuantizeWrapper, ExportableQuantModule
 from aimet_torch.qc_quantize_op import StaticGridQuantWrapper, QcQuantizeOpMode
-from aimet_torch.tensor_quantizer import StaticGridPerChannelQuantizer, TensorQuantizer
-from aimet_torch.adaround.adaround_tensor_quantizer import AdaroundTensorQuantizer
+from aimet_torch.tensor_quantizer import TensorQuantizer
+from aimet_torch.adaround.adaround_wrapper import AdaroundWrapper
 from aimet_torch.adaround.adaround_optimizer import AdaroundOptimizer
 from aimet_torch.adaround.adaround_loss import AdaroundHyperParameters
-from aimet_torch.adaround.activation_sampler import create_modulelist_for_group_modules, get_block_inputs,\
-    get_block_outputs
+from aimet_torch.adaround.activation_sampler import create_modulelist_for_group_modules, get_block_inputs, \
+    get_block_outputs, create_cached_block_schedule_list
+from aimet_torch.utils import get_named_module
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -140,9 +141,9 @@ class Adaround:
         """
         # pylint: disable=too-many-arguments
         # Create Quant sim with given parameters
-        quant_sim = QuantizationSimModel(model, dummy_input=dummy_input, quant_scheme=default_quant_scheme,
-                                         default_param_bw=default_param_bw,
-                                         config_file=default_config_file)
+        quant_sim = cls._get_quantsim(model, dummy_input=dummy_input, quant_scheme=default_quant_scheme,
+                                      default_param_bw=default_param_bw,
+                                      config_file=default_config_file)
 
         # For the modules in the param_bw_override_list, override the default parameter bitwidths in the QuantSim
         if param_bw_override_list:
@@ -178,9 +179,7 @@ class Adaround:
         """
 
         # Sanity check: All the input/output quantizers should be disabled
-        _, input_quantizers, output_quantizers = utils.get_all_quantizers(quant_sim.model)
-        for quantizer in itertools.chain(input_quantizers, output_quantizers):
-            assert not quantizer.enabled
+        cls._check_input_output_quantizers_for_adaround(quant_sim.model)
 
         # Get the module - activation function pair using ConnectedGraph
         module_act_func_pair = connectedgraph_utils.get_module_act_func_pair(model, dummy_input)
@@ -190,7 +189,7 @@ class Adaround:
         # Export quantization encodings to JSON-formatted file
         cls._export_encodings_to_json(path, filename_prefix, quant_sim)
 
-        SaveUtils.remove_quantization_wrappers(quant_sim.model)
+        cls._remove_quantization_wrappers(quant_sim.model)
         logger.info('Completed Adarounding Model')
         return quant_sim.model
 
@@ -218,11 +217,7 @@ class Adaround:
         num_iterations = params.num_iterations
 
         if num_iterations is None:
-            param_quantizers, _, _ = utils.get_all_quantizers(quant_sim.model)
-            lowest_weight_bw = min(
-                quantizer.bitwidth for quantizer in param_quantizers
-                if quantizer.enabled and quantizer.data_type == QuantizationDataType.int
-            )
+            lowest_weight_bw = cls._get_lowest_weight_bw(quant_sim.model)
             # If the lowest wegith bitwidth is < 8, then set num_iterations to 15K by default
             if lowest_weight_bw < 8:
                 num_iterations = 15000
@@ -239,61 +234,99 @@ class Adaround:
             # AdaRound must be applied to modules in the order of occurrence
             if checkpoints_config:
                 # Load the predefined json file for checkpoints info
-                ckpts_file = json.load(open(checkpoints_config))
-                assert 'grouped_modules' in ckpts_file.keys(),\
-                    "Please provide a dictionary of grouped_modules in the file to define checkpoints"
-                assert 'include_static_inputs' in ckpts_file.keys(),\
-                    "Please provide a dictionary of include_static_inputs in the file to define checkpoints"
-                assert 'cache_on_cpu' in ckpts_file.keys(),\
+                checkpoint_config = json.load(open(checkpoints_config))
+                convert_configs_values_to_bool(checkpoint_config)
+
+                assert 'cache_on_cpu' in checkpoint_config.keys(), \
                     "Please define cache_on_cpu to determine whether to cache intermediate tensors on CPU"
+                cache_on_cpu = checkpoint_config['cache_on_cpu']
 
-                grouped_modules = ckpts_file['grouped_modules']
-                breakpoint_module_name = ckpts_file['grouped_modules'][list(grouped_modules.keys())[0]][0]
-                include_static_inputs = ckpts_file['include_static_inputs']
-                cache_on_cpu = ckpts_file['cache_on_cpu']
-                cached_fp_dataset, cached_quant_dataset = get_block_inputs(model, quant_sim,
-                                                                           breakpoint_module_name,
-                                                                           cached_dataset, cache_on_cpu,
-                                                                           params.forward_fn, params.num_batches,
-                                                                           WORKING_DIR)
-                # Get the device of model to latter be used to place input tensor on the same device
-                device = utils.get_device(model)
-                model.cpu()
-                quant_sim.model.cpu()
+                checkpoint_type = checkpoint_config.get('checkpoint_type', 'sequential')
+                if checkpoint_type == 'sequential':
+                    assert 'grouped_modules' in checkpoint_config.keys(), \
+                        "Please provide a dictionary of grouped_modules in the file to define checkpoints"
+                    assert 'include_static_inputs' in checkpoint_config.keys(), \
+                        "Please provide a dictionary of include_static_inputs in the file to define checkpoints"
 
-                # Forward function for the ModuleList object
-                def fwd_mod_ls(mod_ls, x):
-                    for mod in mod_ls:
-                        x = params.forward_fn(mod, x)
-                    return x
+                    grouped_modules = checkpoint_config['grouped_modules']
+                    breakpoint_module_name = checkpoint_config['grouped_modules'][list(grouped_modules.keys())[0]][0]
+                    include_static_inputs = checkpoint_config['include_static_inputs']
+                    cached_fp_dataset, cached_quant_dataset = get_block_inputs(model, quant_sim,
+                                                                               breakpoint_module_name,
+                                                                               cached_dataset, cache_on_cpu,
+                                                                               params.forward_fn, params.num_batches,
+                                                                               WORKING_DIR)
+                    # Get the device of model to latter be used to place input tensor on the same device
+                    device = utils.get_device(model)
+                    model.cpu()
+                    quant_sim.model.cpu()
 
-                sub_fp_models, sub_sim_models = create_modulelist_for_group_modules(model, quant_sim, grouped_modules)
-                for i, (fp_block, quant_sim_block, static_input) in enumerate(zip(sub_fp_models,
-                                                                                  sub_sim_models,
-                                                                                  include_static_inputs)):
-                    modules = utils.get_ordered_list_of_modules(fp_block, cached_fp_dataset[0], fwd_mod_ls)
-                    cls._run_adaround_model(modules, fp_block, quant_sim_block,
-                                            module_act_func_pair, opt_params,
-                                            fwd_mod_ls,
-                                            cached_fp_dataset, cached_quant_dataset)
+                    # Forward function for the ModuleList object
+                    def fwd_mod_ls(mod_ls, x):
+                        for mod in mod_ls:
+                            x = params.forward_fn(mod, x)
+                        return x
 
-                    # Get the outputs from the current block and assign to be the inputs for next block
-                    # except for the last block
-                    if i < len(sub_fp_models) - 1:
-                        get_block_outputs(fp_block, quant_sim_block, static_input,
-                                          cached_fp_dataset, cached_quant_dataset, cache_on_cpu,
-                                          fwd_mod_ls, device, WORKING_DIR)
+                    sub_fp_models, sub_sim_models = create_modulelist_for_group_modules(model, quant_sim, grouped_modules)
+                    for i, (fp_block, quant_sim_block, static_input) in enumerate(zip(sub_fp_models,
+                                                                                      sub_sim_models,
+                                                                                      include_static_inputs)):
+                        modules = utils.get_ordered_list_of_modules(fp_block, cached_fp_dataset[0], fwd_mod_ls)
+                        cls._run_adaround_model(modules, fp_block, quant_sim_block,
+                                                module_act_func_pair, opt_params,
+                                                fwd_mod_ls,
+                                                cached_fp_dataset, cached_quant_dataset)
 
-                # After finishing Adaround, placing the quant model back to its original device
-                quant_sim.model.to(device)
+                        # Get the outputs from the current block and assign to be the inputs for next block
+                        # except for the last block
+                        if i < len(sub_fp_models) - 1:
+                            get_block_outputs(fp_block, quant_sim_block, static_input,
+                                              cached_fp_dataset, cached_quant_dataset, cache_on_cpu,
+                                              fwd_mod_ls, device, WORKING_DIR)
+
+                    # After finishing Adaround, placing the quant model back to its original device
+                    quant_sim.model.to(device)
+                else:
+                    assert 'cached_blocks' in checkpoint_config.keys(), \
+                        "Please provide a list of modules that  can be cached"
+
+                    block_list = create_cached_block_schedule_list(
+                        model, dummy_input, checkpoint_config['cached_blocks'], AdaroundSupportedModules)
+
+                    for block_cfg, modules in tqdm(block_list, desc='block'):
+                        if block_cfg is None: # doesn't belong to a cached block
+                            cls._run_adaround_model(modules, model, quant_sim.model, module_act_func_pair, opt_params,
+                                                    params.forward_fn, cached_dataset)
+                        else:
+                            block_name, fp_block = block_cfg
+                            quant_sim_block: torch.nn.Module = get_named_module(quant_sim.model, block_name)
+
+                            cached_fp_dataset, cached_quant_dataset = get_block_inputs(model, quant_sim,
+                                                                                       block_name,
+                                                                                       cached_dataset, cache_on_cpu,
+                                                                                       params.forward_fn,
+                                                                                       params.num_batches,
+                                                                                       WORKING_DIR,
+                                                                                       incl_kwargs=True)
+
+                            def block_fwd(_model, x):
+                                return _model(*x)
+
+                            cls._run_adaround_model(modules, fp_block, quant_sim_block, module_act_func_pair,
+                                                    opt_params,
+                                                    block_fwd, cached_fp_dataset, cached_quant_dataset)
+                            del cached_fp_dataset
+                            del cached_quant_dataset
             else:
                 modules = utils.get_ordered_list_of_modules(model, dummy_input)
                 cls._run_adaround_model(modules, model, quant_sim.model, module_act_func_pair, opt_params,
                                         params.forward_fn, cached_dataset)
         finally:
-            if os.path.exists(WORKING_DIR):
+            try:
                 logger.info('Deleting model inputs from location: %s', WORKING_DIR)
                 shutil.rmtree(WORKING_DIR)
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def _run_adaround_model(cls, modules: List, model: torch.nn.Module, quant_sim_model: torch.nn.Module,
@@ -322,23 +355,23 @@ class Adaround:
                 if not quant_wrapper:
                     continue
 
-                # Temporarily replace quant module's tensor quantizer with Adaround tensor quantizer
-                with cls._replace_tensor_quantizer(quant_wrapper):
+                # Wraps the quant module with adaround wrapper
+                # and temporarily replace quant module with wrapped module
+                with cls._replace_quantization_layer(quant_sim_model, name) as adaround_wrapper:
 
                     # Get module's next following activation function
                     act_func = module_act_func_pair[module]
 
                     logger.info("Started Optimizing weight rounding of module: %s", name)
-                    AdaroundOptimizer.adaround_module(module, quant_wrapper, model, quant_sim_model, act_func,
+                    AdaroundOptimizer.adaround_module(module, adaround_wrapper, model, quant_sim_model, act_func,
                                                       cached_dataset, forward_fn, opt_params, cached_quant_dataset)
-                    weight = quant_wrapper._module_to_wrap.weight
-                    quantizer = quant_wrapper.param_quantizers['weight']
+                    weight = adaround_wrapper.weight
 
                     # Fold trained alpha to weight
                     with torch.no_grad():
                         # Use soft rounding to compute Adarounded weight
-                        quantizer.use_soft_rounding = True
-                        adarounded_weight = quantizer.adaround_weights(weight)
+                        adaround_wrapper.use_soft_rounding = True
+                        adarounded_weight = adaround_wrapper.apply_adaround(weight)
                         weight.copy_(adarounded_weight)
                         del adarounded_weight
 
@@ -368,35 +401,70 @@ class Adaround:
                 quant_module.set_mode(QcQuantizeOpMode.ACTIVE)
 
     @staticmethod
+    def _get_quantsim(model: torch.nn.Module, dummy_input: torch.Tensor,
+                      quant_scheme: QuantScheme, default_param_bw: int, config_file: str):
+        return QuantizationSimModel(model, dummy_input=dummy_input, quant_scheme=quant_scheme,
+                                    default_param_bw=default_param_bw,
+                                    config_file=config_file)
+
+    @staticmethod
+    def _get_adaround_wrapper(quant_module: QcQuantizeWrapper):
+        return AdaroundWrapper(quant_module)
+
+    @staticmethod
+    def _remove_quantization_wrappers(module: torch.nn.Module):
+        SaveUtils.remove_quantization_wrappers(module)
+
+    @staticmethod
     @contextlib.contextmanager
-    def _replace_tensor_quantizer(quant_module: StaticGridQuantWrapper):
+    def _patch_module_layer(model, layer_name, new_layer):
+        """
+        Temporarily replace model layer
+        """
+        original_layer = getattr(model, layer_name)
+        setattr(model, layer_name, new_layer)
+        yield
+        setattr(model, layer_name, original_layer)
+
+    @staticmethod
+    def _validate_quant_module_for_adaround(quant_module: StaticGridQuantWrapper):
+        assert quant_module.param_quantizers['weight'], '%s does not have weight parameter.' % quant_module
+        assert quant_module.param_quantizers['weight'].encoding, '%s encoding needs to be set.' % quant_module
+
+    @staticmethod
+    def _check_input_output_quantizers_for_adaround(quant_model: torch.nn.Module):
+        _, input_quantizers, output_quantizers = utils.get_all_quantizers(quant_model)
+        for quantizer in itertools.chain(input_quantizers, output_quantizers):
+            assert not quantizer.enabled
+
+    @staticmethod
+    def _get_lowest_weight_bw(quant_model: torch.nn.Module):
+        param_quantizers, _, _ = utils.get_all_quantizers(quant_model)
+        return min(
+            quantizer.bitwidth for quantizer in param_quantizers
+            if quantizer.enabled and quantizer.data_type == QuantizationDataType.int
+        )
+
+    @classmethod
+    @contextlib.contextmanager
+    def _replace_quantization_layer(cls, quant_sim_model: torch.nn.Module, module_name: str):
         """
         Replace the quantized module's weight tensor quantizer with the Adaround tensor quantizer
         :param quant_module: quant module
         """
-        assert quant_module.param_quantizers['weight'], '%s does not have weight parameter.' % quant_module
-        assert quant_module.param_quantizers['weight'].encoding, '%s encoding needs to be set.' % quant_module
+        quant_module = utils.get_named_module(quant_sim_model, module_name)
+        cls._validate_quant_module_for_adaround(quant_module)
+        adaround_layer = cls._get_adaround_wrapper(quant_module)
 
-        quantizer = quant_module.param_quantizers['weight']
-        ch_axis = 0
-        if isinstance(quantizer, StaticGridPerChannelQuantizer):
-            # pylint: disable=protected-access
-            ch_axis = quantizer._ch_axis
+        # We need to look for the container to patch for modules inside submodule
+        upper_module = quant_sim_model
+        upper_module_name, _, target_module_name = module_name.rpartition('.')
+        if upper_module_name:
+            upper_module = utils.get_named_module(quant_sim_model, upper_module_name)
 
-        adaround_quantizer = AdaroundTensorQuantizer(quantizer.bitwidth, 'Adaptive', quantizer.quant_scheme,
-                                                     quantizer.use_symmetric_encodings, quantizer.enabled, ch_axis)
-        adaround_quantizer.use_strict_symmetric = quantizer.use_strict_symmetric
-        adaround_quantizer.use_unsigned_symmetric = quantizer.use_unsigned_symmetric
-
-        # Set the encodings and replace by Adaround tensor quantizer
-        adaround_quantizer.encoding = quantizer.encoding
-
-        try:
-            quant_module.param_quantizers['weight'] = adaround_quantizer
-            yield
-        finally:
-            # Restore original quantizer
-            quant_module.param_quantizers['weight'] = quantizer
+        # Temporarily replace quant module with wrapped module
+        with cls._patch_module_layer(upper_module, target_module_name, adaround_layer):
+            yield adaround_layer
 
     @staticmethod
     def _get_quant_wrapper(quant_sim_model: torch.nn.Module, module_name: str) -> Union[StaticGridQuantWrapper, None]:
@@ -428,31 +496,31 @@ class Adaround:
         param_encodings = {}
 
         for name, quant_module in quant_sim.model.named_modules():
-            if isinstance(quant_module, StaticGridQuantWrapper) and \
-                    isinstance(quant_module._module_to_wrap, AdaroundSupportedModules):
-                quantizer = quant_module.param_quantizers['weight']
+            if isinstance(quant_module, ExportableQuantModule) and \
+                    isinstance(quant_module.get_original_module(), AdaroundSupportedModules):
 
-                if isinstance(quantizer, TensorQuantizer):
+                if 'weight' in quant_module.param_quantizers:
                     cls._update_param_encodings_dict(quant_module, name, param_encodings)
 
+        # Unify the encoding format to be same as that of full encoding export file
+        encoding = {'param_encodings': param_encodings}
         # export encodings to JSON file
         os.makedirs(os.path.abspath(path), exist_ok=True)
         encoding_file_path = os.path.join(path, filename_prefix + '.encodings')
         with open(encoding_file_path, 'w') as encoding_fp:
-            json.dump(param_encodings, encoding_fp, sort_keys=True, indent=4)
+            json.dump(encoding, encoding_fp, sort_keys=True, indent=4)
 
     @classmethod
-    def _update_param_encodings_dict(cls, quant_module: StaticGridQuantWrapper, name: str, param_encodings: Dict):
+    def _update_param_encodings_dict(cls, quant_module: ExportableQuantModule, name: str, param_encodings: Dict):
         """
         Add module's weight parameter encodings to dictionary to be used for exporting encodings
         :param quant_module: quant module
         :param name: name of module
         :param param_encodings: Dictionary of param encodings
         """
-        for orig_param_name, param_quantizer in quant_module.param_quantizers.items():
-            if orig_param_name == 'weight':
+        for orig_param_name, encodings in quant_module.export_param_encodings().items():
+            if orig_param_name == 'weight' and encodings:
                 param_name = name + '.' + orig_param_name
-                encodings = cls._create_encodings_dict_for_quantizer(param_quantizer)
                 param_encodings[param_name] = encodings
 
     @staticmethod
@@ -498,8 +566,8 @@ class Adaround:
         # Create a mapping of QuantSim model's AdaRoundable module name and their module
         name_to_module = {}
         for q_name, q_module in quant_sim.model.named_modules():
-            if isinstance(q_module, QcQuantizeWrapper):
-                if isinstance(q_module._module_to_wrap, AdaroundSupportedModules):  # pylint: disable=protected-access
+            if isinstance(q_module, ExportableQuantModule):
+                if isinstance(q_module.get_original_module(), AdaroundSupportedModules):  # pylint: disable=protected-access
                     name_to_module[q_name] = q_module
 
         # For the modules specified in the param_bw_override_list, set the weight quantizer bitwidth
@@ -563,9 +631,9 @@ class Adaround:
         # pylint: disable=too-many-arguments
         assert checkpoints_config is not None, "To run Adaround with cached tensors, please provide a JSON file with checkpoints defined"
         # Create Quant sim with given parameters
-        quant_sim = QuantizationSimModel(model, dummy_input=dummy_input, quant_scheme=default_quant_scheme,
-                                         default_param_bw=default_param_bw,
-                                         config_file=default_config_file)
+        quant_sim = cls._get_quantsim(model, dummy_input=dummy_input, quant_scheme=default_quant_scheme,
+                                      default_param_bw=default_param_bw,
+                                      config_file=default_config_file)
 
         # For the modules in the param_bw_override_list, override the default parameter bitwidths in the QuantSim
         if param_bw_override_list:
